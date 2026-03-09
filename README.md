@@ -71,3 +71,14 @@ export default defineConfig([
   },
 ])
 ```
+
+## Netlify Deployment
+
+1. **Build Settings**: (Sudah otomatis dikonfigurasi lewat `netlify.toml`)
+   - Branch: `master`
+   - Build Command: `npm run build`
+   - Publish directory: `dist`
+2. **Environment Variables**:
+   Tambahkan di Site Settings Netlify:
+   - `VITE_SUPABASE_URL`: `https://twhzeibzgskajtkvgaso.supabase.co`
+   - `VITE_SUPABASE_ANON_KEY`: `sb_publishable_sezGDyOsK8AfqFIlHih54Q_VsrxFvsW`
