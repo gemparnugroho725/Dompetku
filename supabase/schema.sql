@@ -5,6 +5,9 @@
 -- 1. Drop existing tables and triggers if they exist
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 DROP FUNCTION IF EXISTS public.handle_new_user();
+DROP TABLE IF EXISTS public.telegram_pending_transactions;
+DROP TABLE IF EXISTS public.telegram_link_tokens;
+DROP TABLE IF EXISTS public.telegram_links;
 DROP TABLE IF EXISTS public.transactions;
 DROP TABLE IF EXISTS public.categories;
 DROP TABLE IF EXISTS public.accounts;
@@ -44,6 +47,7 @@ CREATE TABLE public.transactions (
   date DATE NOT NULL,
   type TEXT NOT NULL CHECK (type IN ('income', 'expense', 'transfer')),
   account_id UUID NOT NULL REFERENCES public.accounts(id) ON DELETE CASCADE,
+  to_account_id UUID REFERENCES public.accounts(id) ON DELETE SET NULL,
   category_id UUID REFERENCES public.categories(id) ON DELETE SET NULL, -- Nullable for transfer
   amount NUMERIC NOT NULL CHECK (amount > 0),
   description TEXT,
@@ -52,11 +56,51 @@ CREATE TABLE public.transactions (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
+CREATE TABLE public.telegram_links (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
+  telegram_chat_id BIGINT NOT NULL UNIQUE,
+  telegram_user_id BIGINT,
+  telegram_username TEXT,
+  telegram_first_name TEXT,
+  telegram_last_name TEXT,
+  is_active BOOLEAN DEFAULT true NOT NULL,
+  linked_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+  last_interaction_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE TABLE public.telegram_link_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  consumed_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+CREATE TABLE public.telegram_pending_transactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  telegram_chat_id BIGINT NOT NULL,
+  source_message TEXT NOT NULL,
+  parsed_payload JSONB NOT NULL,
+  ai_model TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected', 'failed')),
+  telegram_message_id BIGINT,
+  transaction_id UUID REFERENCES public.transactions(id) ON DELETE SET NULL,
+  error_message TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+  confirmed_at TIMESTAMP WITH TIME ZONE
+);
+
 -- 3. Configure Row Level Security (RLS)
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.accounts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.telegram_links ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.telegram_link_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.telegram_pending_transactions ENABLE ROW LEVEL SECURITY;
 
 -- 4. Create Policies
 
@@ -109,6 +153,18 @@ ON public.transactions FOR UPDATE USING (auth.uid() = user_id);
 CREATE POLICY "Users can delete their own transactions" 
 ON public.transactions FOR DELETE USING (auth.uid() = user_id);
 
+-- Telegram Links Policies
+CREATE POLICY "Users can view their own telegram links"
+ON public.telegram_links FOR SELECT USING (auth.uid() = user_id);
+
+-- Telegram Link Tokens Policies
+CREATE POLICY "Users can view their own telegram link tokens"
+ON public.telegram_link_tokens FOR SELECT USING (auth.uid() = user_id);
+
+-- Telegram Pending Transactions Policies
+CREATE POLICY "Users can view their own telegram pending transactions"
+ON public.telegram_pending_transactions FOR SELECT USING (auth.uid() = user_id);
+
 -- 5. Create Trigger to Auto-create Profile on Signup
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS trigger AS $$
@@ -144,3 +200,8 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+
+CREATE INDEX idx_transactions_user_date ON public.transactions(user_id, date DESC);
+CREATE INDEX idx_telegram_link_tokens_token ON public.telegram_link_tokens(token);
+CREATE INDEX idx_telegram_link_tokens_user_id ON public.telegram_link_tokens(user_id);
+CREATE INDEX idx_telegram_pending_transactions_user_status ON public.telegram_pending_transactions(user_id, status, created_at DESC);

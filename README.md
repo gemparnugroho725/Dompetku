@@ -82,3 +82,40 @@ export default defineConfig([
    Tambahkan di Site Settings Netlify:
    - `VITE_SUPABASE_URL`: `https://twhzeibzgskajtkvgaso.supabase.co`
    - `VITE_SUPABASE_ANON_KEY`: `sb_publishable_sezGDyOsK8AfqFIlHih54Q_VsrxFvsW`
+
+## Telegram + Aerolink Integration
+
+Project ini sekarang menyiapkan fondasi integrasi Telegram dengan alur:
+
+1. User login ke aplikasi web.
+2. User generate token linking Telegram dari dashboard.
+3. User kirim `/start <token>` ke bot Telegram.
+4. Chat transaksi diproses oleh Aerolink model `claude-opus-4-8`.
+5. Bot mengirim draft transaksi untuk dikonfirmasi.
+6. Jika user menekan `Benar`, transaksi disimpan ke Supabase.
+
+### Supabase Edge Functions
+
+- `telegram-link`: generate token linking dan baca status koneksi Telegram user
+- `telegram-webhook`: menerima update Telegram, menganalisis pesan, dan memproses konfirmasi
+
+### Edge Function Secrets
+
+Set secret berikut di Supabase sebelum deploy function:
+
+- `PROJECT_URL`
+- `PROJECT_ANON_KEY`
+- `PROJECT_SERVICE_ROLE_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_BOT_USERNAME`
+- `AEROLINK_API_KEY`
+- `AEROLINK_BASE_URL`
+- `AEROLINK_MODEL`
+
+### Telegram Webhook
+
+Set webhook bot Telegram ke URL function `telegram-webhook`, misalnya:
+
+```bash
+https://<project-ref>.supabase.co/functions/v1/telegram-webhook
+```

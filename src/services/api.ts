@@ -47,6 +47,16 @@ export type Transaction = {
   categories?: Category;
 };
 
+export type TelegramLinkStatus = {
+  isLinked: boolean;
+  telegramUsername: string | null;
+  telegramChatId: string | null;
+  linkedAt: string | null;
+  botUsername: string | null;
+  linkToken: string | null;
+  linkExpiresAt: string | null;
+};
+
 // ACCOUNTS SERVICE
 export const getAccounts = async () => {
   const { data, error } = await supabase
@@ -252,4 +262,22 @@ export const updateMonthlyBudget = async (budget: number) => {
   }
 
   return data[0] as Profile;
+};
+
+// TELEGRAM LINKING SERVICE
+const invokeTelegramLink = async (action: 'status' | 'generate') => {
+  const { data, error } = await supabase.functions.invoke('telegram-link', {
+    body: { action },
+  });
+
+  if (error) throw error;
+  return data as TelegramLinkStatus;
+};
+
+export const getTelegramLinkStatus = async () => {
+  return invokeTelegramLink('status');
+};
+
+export const generateTelegramLinkToken = async () => {
+  return invokeTelegramLink('generate');
 };

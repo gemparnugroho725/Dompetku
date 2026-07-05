@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { getTransactions, getProfile, updateMonthlyBudget, deleteTransaction } from '@/services/api';
 import TransactionEditModal from '@/components/transactions/TransactionEditModal';
+import TelegramLinkCard from '@/components/telegram/TelegramLinkCard';
 import type { Transaction } from '@/services/api';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -328,6 +329,8 @@ export default function DashboardPage() {
           </div>
         </CardContent>
       </Card>
+
+      <TelegramLinkCard />
 
       <div className="grid gap-6 md:grid-cols-2">
         <Card className="border-blue-100 dark:border-border/40 shadow-sm bg-white dark:bg-card group sm:col-span-2">
