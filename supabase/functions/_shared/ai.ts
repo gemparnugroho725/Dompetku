@@ -94,7 +94,9 @@ const normalizeParsedTransaction = (payload: Record<string, unknown>, sourceMess
     : inferAmountFromMessage(sourceMessage);
   const confidence = Number(payload.confidence ?? 0);
 
-  if (!["income", "expense"].includes(String(payload.type))) {
+  const parsedType = String(payload.type);
+
+  if (!["income", "expense", "transfer"].includes(parsedType)) {
     throw new Error("Invalid transaction type returned by AI");
   }
 
@@ -103,12 +105,16 @@ const normalizeParsedTransaction = (payload: Record<string, unknown>, sourceMess
   }
 
   return {
-    type: payload.type as "income" | "expense",
+    type: parsedType as "income" | "expense" | "transfer",
     amount,
-    category: String(payload.category ?? "").trim() || "Lainnya",
+    category: parsedType === "transfer"
+      ? "Transfer Antar Akun"
+      : String(payload.category ?? "").trim() || "Lainnya",
     description: String(payload.description ?? "").trim() || "Catatan dari Telegram",
     date: String(payload.date ?? new Date().toISOString().slice(0, 10)),
     confidence: Number.isFinite(confidence) ? Math.min(Math.max(confidence, 0), 1) : 0,
+    sourceAccountName: String(payload.source_account ?? "").trim() || null,
+    destinationAccountName: String(payload.destination_account ?? "").trim() || null,
   };
 };
 
@@ -120,12 +126,16 @@ export const analyzeTransactionText = async (message: string): Promise<ParsedTra
     "Kamu menganalisis chat keuangan pribadi dalam bahasa Indonesia.",
     "Balas HANYA JSON valid tanpa markdown, tanpa penjelasan tambahan.",
     "Gunakan schema ini:",
-    '{"type":"income|expense","amount":15000,"category":"nama kategori","description":"deskripsi singkat","date":"YYYY-MM-DD","confidence":0.0}',
+    '{"type":"income|expense|transfer","amount":15000,"category":"nama kategori atau Transfer Antar Akun","description":"deskripsi singkat","date":"YYYY-MM-DD","confidence":0.0,"source_account":"nama akun asal atau null","destination_account":"nama akun tujuan atau null"}',
     "Aturan:",
-    "- type hanya income atau expense",
+    "- type hanya income, expense, atau transfer",
+    "- gunakan transfer jika uang hanya pindah antar akun milik user sendiri",
+    "- contoh transfer: 'masuk cash dari BRI', 'tarik tunai dari BCA', 'transfer BRI ke Dana 50000'",
     "- amount harus angka bulat tanpa titik/koma",
-    "- category harus singkat dan relevan",
+    "- category harus singkat dan relevan, kecuali transfer pakai 'Transfer Antar Akun'",
     "- description merangkum transaksi user",
+    "- source_account diisi kalau akun asal disebut user",
+    "- destination_account diisi kalau akun tujuan disebut user",
     `- tanggal hari ini adalah ${todayDate}`,
     `- jika user tidak menyebut tanggal secara eksplisit, WAJIB pakai tanggal ${todayDate}`,
     "- confidence rentang 0 sampai 1",
@@ -174,4 +184,77 @@ export const analyzeTransactionText = async (message: string): Promise<ParsedTra
   }
 
   return parsed;
+};
+
+export const generateAuditRecommendation = async (input: {
+  periodLabel: string;
+  income: number;
+  expense: number;
+  net: number;
+  budgetUsage: number | null;
+  topCategoryName: string | null;
+  topCategoryAmount: number;
+  transactionCount: number;
+}) => {
+  const prompt = [
+    "Kamu adalah auditor keuangan pribadi yang ringkas dan praktis.",
+    "Balas dalam bahasa Indonesia.",
+    "Tulis maksimal 3 poin rekomendasi.",
+    "Fokus pada apakah pengeluaran masih sehat, apakah ada tanda berlebihan, dan saran tindakan berikutnya.",
+    "Jangan pakai markdown table.",
+    "",
+    `Periode: ${input.periodLabel}`,
+    `Jumlah transaksi: ${input.transactionCount}`,
+    `Pemasukan: ${input.income}`,
+    `Pengeluaran: ${input.expense}`,
+    `Selisih: ${input.net}`,
+    `Pemakaian budget bulanan: ${input.budgetUsage === null ? "tidak tersedia" : `${input.budgetUsage.toFixed(0)}%`}`,
+    `Kategori pengeluaran terbesar: ${input.topCategoryName ?? "tidak ada"} (${input.topCategoryAmount})`,
+    "",
+    "Format balasan:",
+    "Rekomendasi:",
+    "1. ...",
+    "2. ...",
+    "3. ...",
+  ].join("\n");
+
+  const response = await fetch(`${env.aerolinkBaseUrl.replace(/\/$/, "")}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": env.aerolinkApiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: env.aerolinkModel,
+      max_tokens: 250,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Aerolink request failed: ${response.status} ${body}`);
+  }
+
+  const data = await response.json();
+  const textContent = Array.isArray(data.content)
+    ? data.content
+        .filter((item: { type?: string }) => item.type === "text")
+        .map((item: { text?: string }) => item.text ?? "")
+        .join("\n")
+        .trim()
+    : "";
+
+  if (!textContent) {
+    throw new Error("AI audit response was empty");
+  }
+
+  return textContent;
 };

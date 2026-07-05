@@ -1,4 +1,4 @@
-import { analyzeTransactionText } from "../_shared/ai.ts";
+import { analyzeTransactionText, generateAuditRecommendation } from "../_shared/ai.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { env } from "../_shared/env.ts";
 import { adminClient } from "../_shared/supabase.ts";
@@ -69,12 +69,39 @@ const getWeekRange = (dateString: string) => {
   };
 };
 
+const getPreviousWeekRange = (dateString: string) => {
+  const current = getWeekRange(dateString);
+  const previousEnd = shiftDate(current.startDate, -1);
+  const previousStart = shiftDate(previousEnd, -6);
+  return {
+    startDate: previousStart,
+    endDate: previousEnd,
+  };
+};
+
+const getPreviousMonthRange = (dateString: string) => {
+  const [year, month] = dateString.split("-").map(Number);
+  const previousMonthDate = new Date(Date.UTC(year, month - 2, 1));
+  return getMonthRange(previousMonthDate.toISOString().slice(0, 10));
+};
+
 const buildConfirmationText = (parsed: ParsedTransaction) =>
   [
     "Saya baca transaksinya seperti ini:",
-    `Tipe: ${parsed.type === "expense" ? "Pengeluaran" : "Pemasukan"}`,
+    `Tipe: ${
+      parsed.type === "expense"
+        ? "Pengeluaran"
+        : parsed.type === "income"
+          ? "Pemasukan"
+          : "Transfer Antar Akun"
+    }`,
     `Jumlah: ${formatCurrency(parsed.amount)}`,
-    `Kategori: ${parsed.category}`,
+    ...(parsed.type === "transfer"
+      ? [
+          `Dari: ${parsed.sourceAccountName ?? "-"}`,
+          `Ke: ${parsed.destinationAccountName ?? "-"}`,
+        ]
+      : [`Kategori: ${parsed.category}`]),
     `Tanggal: ${parsed.date}`,
     `Catatan: ${parsed.description}`,
     `Confidence AI: ${(parsed.confidence * 100).toFixed(0)}%`,
@@ -98,6 +125,17 @@ type AccountOption = {
   initial_balance?: number | string;
 };
 
+type TransactionSummary = {
+  income: number;
+  expense: number;
+  net: number;
+  topCategoryName: string | null;
+  topCategoryAmount: number;
+  expenseByCategory: Array<{ name: string; amount: number }>;
+};
+
+type PendingAccountRole = "single" | "source" | "destination";
+
 const compactUuid = (value: string) => value.replaceAll("-", "");
 const expandCompactUuid = (value: string) =>
   `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
@@ -106,6 +144,15 @@ const decodeUuidToken = (value?: string) => {
   return value.includes("-") ? value : expandCompactUuid(value);
 };
 const AWAITING_ACCOUNT_MARKER = "awaiting_account_name";
+const buildAwaitingAccountMarker = (role: PendingAccountRole) => `${AWAITING_ACCOUNT_MARKER}:${role}`;
+const parseAwaitingAccountMarker = (value?: string | null): PendingAccountRole | null => {
+  if (!value || !value.startsWith(`${AWAITING_ACCOUNT_MARKER}:`)) {
+    return null;
+  }
+
+  const role = value.slice(AWAITING_ACCOUNT_MARKER.length + 1);
+  return role === "single" || role === "source" || role === "destination" ? role : null;
+};
 const normalizeText = (value: string) =>
   value
     .toLowerCase()
@@ -235,32 +282,124 @@ const getUserAccounts = async (userId: string): Promise<AccountOption[]> => {
   return data ?? [];
 };
 
-const detectMentionedAccount = async (userId: string, ...candidates: string[]) => {
+const detectMentionedAccounts = async (userId: string, ...candidates: string[]) => {
   const accounts = await getUserAccounts(userId);
   if (accounts.length === 0) {
-    return null;
+    return [];
   }
 
   const normalizedCandidates = candidates
     .map((candidate) => normalizeText(candidate))
     .filter(Boolean);
 
-  for (const account of accounts) {
+  return accounts.filter((account) => {
     const accountName = normalizeText(account.name);
-    if (!accountName) continue;
+    if (!accountName) return false;
 
-    const matched = normalizedCandidates.some((candidate) =>
+    return normalizedCandidates.some((candidate) =>
       candidate === accountName ||
       candidate.includes(accountName) ||
       accountName.includes(candidate)
     );
+  });
+};
 
-    if (matched) {
+const detectMentionedAccount = async (userId: string, ...candidates: string[]) => {
+  const matches = await detectMentionedAccounts(userId, ...candidates);
+  return matches[0] ?? null;
+};
+
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const inferTransferAccountFromText = (
+  accounts: AccountOption[],
+  sourceMessage: string,
+  role: "source" | "destination",
+) => {
+  const normalizedMessage = normalizeText(sourceMessage);
+
+  for (const account of accounts) {
+    const accountName = normalizeText(account.name);
+    if (!accountName) continue;
+
+    const escapedName = escapeRegex(accountName).replace(/\s+/g, "\\s+");
+    const patterns = role === "source"
+      ? [
+          new RegExp(`\\bdari\\s+${escapedName}\\b`),
+          new RegExp(`\\bpakai\\s+${escapedName}\\b`),
+          new RegExp(`\\bvia\\s+${escapedName}\\b`),
+        ]
+      : [
+          new RegExp(`\\bke\\s+${escapedName}\\b`),
+          new RegExp(`\\bke\\s+akun\\s+${escapedName}\\b`),
+          new RegExp(`\\bke\\s+rekening\\s+${escapedName}\\b`),
+          new RegExp(`\\bmasuk\\s+(?:ke\\s+)?${escapedName}\\b`),
+        ];
+
+    if (patterns.some((pattern) => pattern.test(normalizedMessage))) {
       return account;
     }
   }
 
   return null;
+};
+
+const pickAccountByHint = (accounts: AccountOption[], hint?: string | null) => {
+  const normalizedHint = normalizeText(hint ?? "");
+  if (!normalizedHint) {
+    return null;
+  }
+
+  return accounts.find((account) => {
+    const accountName = normalizeText(account.name);
+    return accountName === normalizedHint || accountName.includes(normalizedHint) || normalizedHint.includes(accountName);
+  }) ?? null;
+};
+
+const resolveTransferAccounts = async (
+  userId: string,
+  parsed: ParsedTransaction,
+  sourceMessage: string,
+) => {
+  const accounts = await getUserAccounts(userId);
+  if (accounts.length === 0) {
+    return { sourceAccount: null, destinationAccount: null };
+  }
+
+  const mentionedAccounts = await detectMentionedAccounts(
+    userId,
+    sourceMessage,
+    parsed.description ?? "",
+    parsed.sourceAccountName ?? "",
+    parsed.destinationAccountName ?? "",
+  );
+
+  const sourceByHint = pickAccountByHint(accounts, parsed.sourceAccountName);
+  const destinationByHint = pickAccountByHint(accounts, parsed.destinationAccountName);
+  const sourceByText = inferTransferAccountFromText(accounts, sourceMessage, "source");
+  const destinationByText = inferTransferAccountFromText(accounts, sourceMessage, "destination");
+
+  let sourceAccount = sourceByHint ?? sourceByText ?? null;
+  let destinationAccount = destinationByHint ?? destinationByText ?? null;
+
+  if (!sourceAccount && mentionedAccounts.length > 0) {
+    sourceAccount = mentionedAccounts[0];
+  }
+
+  if (!destinationAccount) {
+    destinationAccount = mentionedAccounts.find((account) => account.id !== sourceAccount?.id) ?? null;
+  }
+
+  if (sourceAccount?.id === destinationAccount?.id) {
+    if (!sourceByHint) {
+      sourceAccount = null;
+    }
+    if (!destinationByHint) {
+      destinationAccount = null;
+    }
+  }
+
+  return { sourceAccount, destinationAccount };
 };
 
 const createAccountForUser = async (userId: string, name: string) => {
@@ -308,15 +447,24 @@ const buildHelpText = () =>
     "Perintah yang bisa dipakai:",
     "/help - lihat daftar perintah",
     "/checksaldo - cek saldo total dan per akun",
+    "/saldo <akun> - cek saldo akun tertentu",
     "/mutasi - lihat 5 transaksi terakhir",
+    "/cari <kata> - cari transaksi dari kata kunci",
     "/akun - lihat daftar akun",
+    "/budget - cek budget bulan ini",
+    "/ringkasan - ringkasan hari ini, minggu ini, bulan ini",
+    "/topkategori - kategori pengeluaran terbesar bulan ini",
+    "/boros - bandingkan pengeluaran periode sekarang vs sebelumnya",
+    "/status - cek status bot",
+    "/hapus terakhir - hapus transaksi terakhir",
     "/auditharian - audit pengeluaran hari ini",
-    "/auditmingguan - audit 7 hari terakhir",
+    "/auditmingguan - audit minggu kalender ini",
     "/auditbulanan - audit bulan berjalan",
     "",
     "Kamu juga bisa langsung chat transaksi, misalnya:",
     "beli kopi 10000 cash",
     "masuk ke BCA 250000",
+    "transfer BRI ke Cash 100000",
   ].join("\n");
 
 const getAccountsWithBalances = async (userId: string) => {
@@ -449,6 +597,253 @@ const handleMutasiCommand = async (chatId: number, userId: string) => {
   await sendTelegramMessage(chatId, lines.join("\n"));
 };
 
+const handleBudgetCommand = async (chatId: number, userId: string) => {
+  const today = getDateInTimezone();
+  const monthRange = getMonthRange(today);
+  const [transactions, monthlyBudget] = await Promise.all([
+    getTransactionsForRange(userId, monthRange.startDate, monthRange.endDate),
+    getMonthlyBudget(userId),
+  ]);
+
+  const summary = summarizeTransactions(transactions);
+
+  if (monthlyBudget <= 0) {
+    await sendTelegramMessage(
+      chatId,
+      `Budget bulanan belum disetel. Pengeluaran bulan ini: ${formatCurrency(summary.expense)}.`,
+    );
+    return;
+  }
+
+  const remaining = monthlyBudget - summary.expense;
+  const usage = (summary.expense / monthlyBudget) * 100;
+  const status =
+    usage >= 100
+      ? "Budget bulan ini sudah terlewati."
+      : usage >= 90
+        ? "Budget bulan ini hampir habis."
+        : usage >= 70
+          ? "Budget bulan ini mulai ketat."
+          : "Budget bulan ini masih aman.";
+
+  await sendTelegramMessage(
+    chatId,
+    [
+      "Status budget bulan ini:",
+      `Budget: ${formatCurrency(monthlyBudget)}`,
+      `Terpakai: ${formatCurrency(summary.expense)} (${usage.toFixed(0)}%)`,
+      `Sisa: ${formatCurrency(remaining)}`,
+      status,
+    ].join("\n"),
+  );
+};
+
+const handleSaldoCommand = async (chatId: number, userId: string, query: string | null) => {
+  const accounts = await getAccountsWithBalances(userId);
+
+  if (accounts.length === 0) {
+    await sendTelegramMessage(chatId, "Belum ada akun yang terdaftar.");
+    return;
+  }
+
+  if (!query) {
+    await handleCheckSaldoCommand(chatId, userId);
+    return;
+  }
+
+  const normalizedQuery = normalizeText(query);
+  const matched = accounts.find((account) => {
+    const accountName = normalizeText(account.name);
+    return accountName === normalizedQuery || accountName.includes(normalizedQuery) || normalizedQuery.includes(accountName);
+  });
+
+  if (!matched) {
+    await sendTelegramMessage(chatId, `Akun "${query}" tidak ditemukan.`);
+    return;
+  }
+
+  await sendTelegramMessage(chatId, `${matched.name}: ${formatCurrency(matched.balance)}`);
+};
+
+const handleCariCommand = async (chatId: number, userId: string, query: string | null) => {
+  if (!query) {
+    await sendTelegramMessage(chatId, 'Pakai format: /cari <kata>. Contoh: /cari kopi');
+    return;
+  }
+
+  const { data, error } = await adminClient
+    .from("transactions")
+    .select(`
+      id,
+      date,
+      type,
+      amount,
+      description,
+      accounts:account_id (name),
+      categories:category_id (name)
+    `)
+    .eq("user_id", userId)
+    .or(`description.ilike.%${query}%,categories.name.ilike.%${query}%`)
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (error) throw error;
+
+  if (!data || data.length === 0) {
+    await sendTelegramMessage(chatId, `Tidak ada transaksi yang cocok dengan "${query}".`);
+    return;
+  }
+
+  const lines = [
+    `Hasil pencarian "${query}":`,
+    ...data.map((tx, index) => {
+      const direction = tx.type === "income" ? "+" : tx.type === "expense" ? "-" : "";
+      return `${index + 1}. ${tx.date} | ${direction}${formatCurrency(Number(tx.amount ?? 0))} | ${tx.categories?.name ?? "Tanpa kategori"} | ${tx.accounts?.name ?? "-"}${tx.description ? ` - ${tx.description}` : ""}`;
+    }),
+  ];
+
+  await sendTelegramMessage(chatId, lines.join("\n"));
+};
+
+const buildCompactSummaryLine = (label: string, summary: TransactionSummary) =>
+  `${label}: masuk ${formatCurrency(summary.income)}, keluar ${formatCurrency(summary.expense)}, selisih ${formatCurrency(summary.net)}`;
+
+const handleRingkasanCommand = async (chatId: number, userId: string) => {
+  const today = getDateInTimezone();
+  const dayRange = { startDate: today, endDate: today };
+  const weekRange = getWeekRange(today);
+  const monthRange = getMonthRange(today);
+
+  const [daily, weekly, monthly] = await Promise.all([
+    getTransactionsForRange(userId, dayRange.startDate, dayRange.endDate),
+    getTransactionsForRange(userId, weekRange.startDate, weekRange.endDate),
+    getTransactionsForRange(userId, monthRange.startDate, monthRange.endDate),
+  ]);
+
+  const dailySummary = summarizeTransactions(daily);
+  const weeklySummary = summarizeTransactions(weekly);
+  const monthlySummary = summarizeTransactions(monthly);
+
+  const lines = [
+    "Ringkasan cepat:",
+    buildCompactSummaryLine("Hari ini", dailySummary),
+    buildCompactSummaryLine("Minggu ini", weeklySummary),
+    buildCompactSummaryLine("Bulan ini", monthlySummary),
+  ];
+
+  if (monthlySummary.topCategoryName) {
+    lines.push(`Kategori terbesar bulan ini: ${monthlySummary.topCategoryName} (${formatCurrency(monthlySummary.topCategoryAmount)})`);
+  }
+
+  await sendTelegramMessage(chatId, lines.join("\n"));
+};
+
+const handleTopKategoriCommand = async (chatId: number, userId: string) => {
+  const today = getDateInTimezone();
+  const monthRange = getMonthRange(today);
+  const transactions = await getTransactionsForRange(userId, monthRange.startDate, monthRange.endDate);
+  const summary = summarizeTransactions(transactions);
+
+  if (summary.expenseByCategory.length === 0) {
+    await sendTelegramMessage(chatId, "Belum ada pengeluaran bulan ini.");
+    return;
+  }
+
+  const totalExpense = summary.expense || 1;
+  const lines = [
+    "Top kategori pengeluaran bulan ini:",
+    ...summary.expenseByCategory.slice(0, 5).map((item, index) => {
+      const share = (item.amount / totalExpense) * 100;
+      return `${index + 1}. ${item.name} - ${formatCurrency(item.amount)} (${share.toFixed(0)}%)`;
+    }),
+  ];
+
+  await sendTelegramMessage(chatId, lines.join("\n"));
+};
+
+const handleBorosCommand = async (chatId: number, userId: string) => {
+  const today = getDateInTimezone();
+  const currentWeek = getWeekRange(today);
+  const previousWeek = getPreviousWeekRange(today);
+  const currentMonth = getMonthRange(today);
+  const previousMonth = getPreviousMonthRange(today);
+
+  const [currentWeekTx, previousWeekTx, currentMonthTx, previousMonthTx] = await Promise.all([
+    getTransactionsForRange(userId, currentWeek.startDate, currentWeek.endDate),
+    getTransactionsForRange(userId, previousWeek.startDate, previousWeek.endDate),
+    getTransactionsForRange(userId, currentMonth.startDate, currentMonth.endDate),
+    getTransactionsForRange(userId, previousMonth.startDate, previousMonth.endDate),
+  ]);
+
+  const currentWeekSummary = summarizeTransactions(currentWeekTx);
+  const previousWeekSummary = summarizeTransactions(previousWeekTx);
+  const currentMonthSummary = summarizeTransactions(currentMonthTx);
+  const previousMonthSummary = summarizeTransactions(previousMonthTx);
+
+  const weekDiff = currentWeekSummary.expense - previousWeekSummary.expense;
+  const monthDiff = currentMonthSummary.expense - previousMonthSummary.expense;
+
+  const lines = [
+    "Deteksi boros:",
+    `Minggu ini vs minggu lalu: ${formatCurrency(currentWeekSummary.expense)} vs ${formatCurrency(previousWeekSummary.expense)} (${weekDiff >= 0 ? "+" : ""}${formatCurrency(weekDiff)})`,
+    `Bulan ini vs bulan lalu: ${formatCurrency(currentMonthSummary.expense)} vs ${formatCurrency(previousMonthSummary.expense)} (${monthDiff >= 0 ? "+" : ""}${formatCurrency(monthDiff)})`,
+  ];
+
+  lines.push(
+    weekDiff > 0
+      ? "Pengeluaran minggu ini lebih tinggi dari minggu lalu. Cek transaksi impulsif atau kategori yang naik."
+      : "Pengeluaran minggu ini tidak lebih boros dari minggu lalu.",
+  );
+  lines.push(
+    monthDiff > 0
+      ? "Pengeluaran bulan ini lebih tinggi dari bulan lalu. Perhatikan kategori yang mulai membengkak."
+      : "Pengeluaran bulan ini masih lebih terkendali dibanding bulan lalu.",
+  );
+
+  await sendTelegramMessage(chatId, lines.join("\n"));
+};
+
+const handleStatusCommand = async (chatId: number, userId: string) => {
+  const [accounts, latestTransactions] = await Promise.all([
+    getUserAccounts(userId),
+    getLatestTransactions(userId, 1),
+  ]);
+
+  const lines = [
+    "Status bot:",
+    `Bot Telegram: ${env.telegramBotUsername ? `@${env.telegramBotUsername}` : "aktif"}`,
+    `Model AI: ${env.aerolinkModel}`,
+    `Jumlah akun: ${accounts.length}`,
+    `Transaksi terakhir: ${latestTransactions[0] ? `${latestTransactions[0].date} - ${formatCurrency(Number(latestTransactions[0].amount ?? 0))}` : "belum ada"}`,
+  ];
+
+  await sendTelegramMessage(chatId, lines.join("\n"));
+};
+
+const handleDeleteLastCommand = async (chatId: number, userId: string) => {
+  const latestTransactions = await getLatestTransactions(userId, 1);
+  const latest = latestTransactions[0];
+
+  if (!latest) {
+    await sendTelegramMessage(chatId, "Belum ada transaksi yang bisa dihapus.");
+    return;
+  }
+
+  await sendTelegramMessage(
+    chatId,
+    `Hapus transaksi terakhir?\n${latest.date} | ${formatCurrency(Number(latest.amount ?? 0))} | ${latest.categories?.name ?? "Tanpa kategori"}${latest.description ? ` - ${latest.description}` : ""}`,
+    {
+      replyMarkup: {
+        inline_keyboard: [[
+          { text: "Ya, hapus", callback_data: `dl:${compactUuid(latest.id)}` },
+          { text: "Batal", callback_data: `dc:${compactUuid(latest.id)}` },
+        ]],
+      },
+    },
+  );
+};
+
 const getTransactionsForRange = async (userId: string, startDate: string, endDate: string) => {
   const { data, error } = await adminClient
     .from("transactions")
@@ -470,6 +865,44 @@ const getTransactionsForRange = async (userId: string, startDate: string, endDat
   return data ?? [];
 };
 
+const summarizeTransactions = (transactions: Array<{
+  type: string;
+  amount: number | string;
+  categories?: { name?: string | null } | null;
+}>) => {
+  let income = 0;
+  let expense = 0;
+  const expenseByCategory = new Map<string, number>();
+
+  for (const tx of transactions) {
+    const amount = Number(tx.amount ?? 0);
+
+    if (tx.type === "income") {
+      income += amount;
+      continue;
+    }
+
+    if (tx.type === "expense") {
+      expense += amount;
+      const categoryName = tx.categories?.name ?? "Tanpa kategori";
+      expenseByCategory.set(categoryName, (expenseByCategory.get(categoryName) ?? 0) + amount);
+    }
+  }
+
+  const ranked = Array.from(expenseByCategory.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, amount]) => ({ name, amount }));
+
+  return {
+    income,
+    expense,
+    net: income - expense,
+    topCategoryName: ranked[0]?.name ?? null,
+    topCategoryAmount: ranked[0]?.amount ?? 0,
+    expenseByCategory: ranked,
+  } satisfies TransactionSummary;
+};
+
 const getMonthlyBudget = async (userId: string) => {
   const { data, error } = await adminClient
     .from("profiles")
@@ -481,7 +914,29 @@ const getMonthlyBudget = async (userId: string) => {
   return Number(data?.monthly_budget ?? 0);
 };
 
-const buildAuditRecommendations = ({
+const getLatestTransactions = async (userId: string, limit: number) => {
+  const { data, error } = await adminClient
+    .from("transactions")
+    .select(`
+      id,
+      date,
+      type,
+      amount,
+      description,
+      account_id,
+      accounts:account_id (name),
+      categories:category_id (name)
+    `)
+    .eq("user_id", userId)
+    .order("date", { ascending: false })
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data ?? [];
+};
+
+const buildFallbackAuditRecommendations = ({
   periodLabel,
   income,
   expense,
@@ -573,7 +1028,7 @@ const handleAuditCommand = async (
   const sortedCategories = Array.from(expenseByCategory.entries()).sort((a, b) => b[1] - a[1]);
   const [topCategoryName, topCategoryAmount = 0] = sortedCategories[0] ?? [null, 0];
   const budgetUsage = monthlyBudget > 0 ? (expense / monthlyBudget) * 100 : null;
-  const recommendations = buildAuditRecommendations({
+  const fallbackRecommendations = buildFallbackAuditRecommendations({
     periodLabel: periodConfig.label,
     income,
     expense,
@@ -598,16 +1053,33 @@ const handleAuditCommand = async (
   }
 
   lines.push("");
-  lines.push("Rekomendasi:");
-  lines.push(...recommendations.map((item, index) => `${index + 1}. ${item}`));
+
+  try {
+    const aiRecommendation = await generateAuditRecommendation({
+      periodLabel: periodConfig.label,
+      income,
+      expense,
+      net: income - expense,
+      budgetUsage,
+      topCategoryName,
+      topCategoryAmount,
+      transactionCount: transactions.length,
+    });
+    lines.push(aiRecommendation);
+  } catch (_error) {
+    lines.push("Rekomendasi:");
+    lines.push(...fallbackRecommendations.map((item, index) => `${index + 1}. ${item}`));
+  }
 
   await sendTelegramMessage(chatId, lines.join("\n"));
 };
 
 const handleCommandMessage = async (chatId: number, text: string) => {
-  const command = text.split(/\s+/)[0].toLowerCase();
+  const [command, ...args] = text.split(/\s+/);
+  const normalizedCommand = command.toLowerCase();
+  const query = args.join(" ").trim() || null;
 
-  if (command === "/help" || command === "/start") {
+  if (normalizedCommand === "/help" || normalizedCommand === "/start") {
     await sendTelegramMessage(chatId, buildHelpText());
     return true;
   }
@@ -618,37 +1090,80 @@ const handleCommandMessage = async (chatId: number, text: string) => {
     return true;
   }
 
-  if (command === "/checksaldo") {
+  if (normalizedCommand === "/checksaldo") {
     await handleCheckSaldoCommand(chatId, userId);
     return true;
   }
 
-  if (command === "/akun") {
+  if (normalizedCommand === "/saldo") {
+    await handleSaldoCommand(chatId, userId, query);
+    return true;
+  }
+
+  if (normalizedCommand === "/akun") {
     await handleAkunCommand(chatId, userId);
     return true;
   }
 
-  if (command === "/mutasi") {
+  if (normalizedCommand === "/mutasi") {
     await handleMutasiCommand(chatId, userId);
     return true;
   }
 
-  if (command === "/auditharian") {
+  if (normalizedCommand === "/cari") {
+    await handleCariCommand(chatId, userId, query);
+    return true;
+  }
+
+  if (normalizedCommand === "/budget") {
+    await handleBudgetCommand(chatId, userId);
+    return true;
+  }
+
+  if (normalizedCommand === "/ringkasan") {
+    await handleRingkasanCommand(chatId, userId);
+    return true;
+  }
+
+  if (normalizedCommand === "/topkategori") {
+    await handleTopKategoriCommand(chatId, userId);
+    return true;
+  }
+
+  if (normalizedCommand === "/boros") {
+    await handleBorosCommand(chatId, userId);
+    return true;
+  }
+
+  if (normalizedCommand === "/status") {
+    await handleStatusCommand(chatId, userId);
+    return true;
+  }
+
+  if (
+    normalizedCommand === "/hapus_terakhir" ||
+    (normalizedCommand === "/hapus" && normalizeText(query ?? "") === "terakhir")
+  ) {
+    await handleDeleteLastCommand(chatId, userId);
+    return true;
+  }
+
+  if (normalizedCommand === "/auditharian") {
     await handleAuditCommand(chatId, userId, "daily");
     return true;
   }
 
-  if (command === "/auditmingguan") {
+  if (normalizedCommand === "/auditmingguan") {
     await handleAuditCommand(chatId, userId, "weekly");
     return true;
   }
 
-  if (command === "/auditbulanan") {
+  if (normalizedCommand === "/auditbulanan") {
     await handleAuditCommand(chatId, userId, "monthly");
     return true;
   }
 
-  if (command.startsWith("/")) {
+  if (normalizedCommand.startsWith("/")) {
     await sendTelegramMessage(chatId, "Perintah belum tersedia. Coba /help untuk lihat daftar perintah.");
     return true;
   }
@@ -659,10 +1174,10 @@ const handleCommandMessage = async (chatId: number, text: string) => {
 const getAwaitingAccountPendingTransaction = async (userId: string) => {
   const { data, error } = await adminClient
     .from("telegram_pending_transactions")
-    .select("id, user_id, status, parsed_payload, error_message")
+    .select("id, user_id, status, parsed_payload, error_message, source_message")
     .eq("user_id", userId)
     .eq("status", "pending")
-    .eq("error_message", AWAITING_ACCOUNT_MARKER)
+    .like("error_message", `${AWAITING_ACCOUNT_MARKER}:%`)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -671,11 +1186,24 @@ const getAwaitingAccountPendingTransaction = async (userId: string) => {
   return data;
 };
 
-const setPendingAwaitingAccountName = async (pendingId: string) => {
+const setPendingAwaitingAccountName = async (pendingId: string, role: PendingAccountRole) => {
   const { error } = await adminClient
     .from("telegram_pending_transactions")
     .update({
-      error_message: AWAITING_ACCOUNT_MARKER,
+      error_message: buildAwaitingAccountMarker(role),
+    })
+    .eq("id", pendingId)
+    .eq("status", "pending");
+
+  if (error) throw error;
+};
+
+const updatePendingParsedPayload = async (pendingId: string, parsed: ParsedTransaction) => {
+  const { error } = await adminClient
+    .from("telegram_pending_transactions")
+    .update({
+      parsed_payload: parsed,
+      error_message: null,
     })
     .eq("id", pendingId)
     .eq("status", "pending");
@@ -690,11 +1218,57 @@ const handleTransactionMessage = async (
 ) => {
   const awaitingPending = await getAwaitingAccountPendingTransaction(userId);
   if (awaitingPending) {
+    const awaitingRole = parseAwaitingAccountMarker(awaitingPending.error_message) ?? "single";
     const account = await createAccountForUser(userId, text);
-    const parsed = await savePendingTransaction(awaitingPending.id, account.id);
-    await sendTelegramMessage(
+    const parsedPayload = awaitingPending.parsed_payload as ParsedTransaction;
+
+    if (parsedPayload.type !== "transfer" || awaitingRole === "single") {
+      const parsed = await savePendingTransaction(awaitingPending.id, account.id);
+      await sendTelegramMessage(
+        chatId,
+        `Akun ${account.name} sudah saya buat. ${buildSavedTransactionMessage(parsed, account.name)}`,
+      );
+      return;
+    }
+
+    const nextParsed: ParsedTransaction = {
+      ...parsedPayload,
+      sourceAccountName: awaitingRole === "source" ? account.name : parsedPayload.sourceAccountName,
+      destinationAccountName: awaitingRole === "destination" ? account.name : parsedPayload.destinationAccountName,
+    };
+
+    await updatePendingParsedPayload(awaitingPending.id, nextParsed);
+
+    const transferAccounts = await resolveTransferAccounts(
+      userId,
+      nextParsed,
+      awaitingPending.source_message ?? "",
+    );
+
+    if (transferAccounts.sourceAccount && transferAccounts.destinationAccount) {
+      const saved = await savePendingTransaction(
+        awaitingPending.id,
+        transferAccounts.sourceAccount.id,
+        transferAccounts.destinationAccount.id,
+      );
+      await sendTelegramMessage(
+        chatId,
+        `Akun ${account.name} sudah saya buat. ${buildSavedTransactionMessage(
+          saved,
+          transferAccounts.sourceAccount.name,
+          transferAccounts.destinationAccount.name,
+        )}`,
+      );
+      return;
+    }
+
+    await sendTelegramMessage(chatId, `Akun ${account.name} sudah saya buat.`);
+    await askForAccountSelection(
       chatId,
-      `Akun ${account.name} sudah saya buat. Transaksi ${parsed.type === "expense" ? "pengeluaran" : "pemasukan"} sebesar ${formatCurrency(parsed.amount)} juga sudah saya simpan.`,
+      awaitingPending.id,
+      userId,
+      nextParsed,
+      transferAccounts.sourceAccount ? "destination" : "source",
     );
     return;
   }
@@ -738,7 +1312,7 @@ const handleTransactionMessage = async (
 const getPendingTransaction = async (pendingId: string) => {
   const { data: pendingRow, error } = await adminClient
     .from("telegram_pending_transactions")
-    .select("id, user_id, status, parsed_payload, source_message")
+    .select("id, user_id, status, parsed_payload, source_message, error_message")
     .eq("id", pendingId)
     .maybeSingle();
 
@@ -749,11 +1323,23 @@ const getPendingTransaction = async (pendingId: string) => {
   return pendingRow;
 };
 
-const savePendingTransaction = async (pendingId: string, accountId: string) => {
+const savePendingTransaction = async (pendingId: string, accountId: string, toAccountId?: string | null) => {
   const pendingRow = await getPendingTransaction(pendingId);
 
   const parsed = pendingRow.parsed_payload as ParsedTransaction;
-  const categoryId = await resolveCategoryId(pendingRow.user_id, parsed.type, parsed.category);
+  const isTransfer = parsed.type === "transfer";
+
+  if (isTransfer && !toAccountId) {
+    throw new Error("Akun tujuan transfer belum dipilih");
+  }
+
+  if (isTransfer && accountId === toAccountId) {
+    throw new Error("Akun asal dan tujuan transfer tidak boleh sama");
+  }
+
+  const categoryId = isTransfer
+    ? null
+    : await resolveCategoryId(pendingRow.user_id, parsed.type as "income" | "expense", parsed.category);
 
   const { data: transactionRow, error: transactionError } = await adminClient
     .from("transactions")
@@ -762,7 +1348,7 @@ const savePendingTransaction = async (pendingId: string, accountId: string) => {
       date: parsed.date,
       type: parsed.type,
       account_id: accountId,
-      to_account_id: null,
+      to_account_id: isTransfer ? toAccountId : null,
       category_id: categoryId,
       amount: parsed.amount,
       description: parsed.description,
@@ -788,19 +1374,49 @@ const savePendingTransaction = async (pendingId: string, accountId: string) => {
   return parsed;
 };
 
-const askForAccountSelection = async (chatId: number, pendingId: string, userId: string, parsed: ParsedTransaction) => {
+const buildSavedTransactionMessage = (
+  parsed: ParsedTransaction,
+  sourceAccountName?: string | null,
+  destinationAccountName?: string | null,
+) => {
+  if (parsed.type === "transfer") {
+    return `Sip, transfer ${formatCurrency(parsed.amount)} dari ${sourceAccountName ?? "-"} ke ${destinationAccountName ?? "-"} sudah saya simpan.`;
+  }
+
+  return `Sip, transaksi ${parsed.type === "expense" ? "pengeluaran" : "pemasukan"} sebesar ${formatCurrency(parsed.amount)} sudah saya simpan${sourceAccountName ? ` ke akun ${sourceAccountName}` : ""}.`;
+};
+
+const askForAccountSelection = async (
+  chatId: number,
+  pendingId: string,
+  userId: string,
+  parsed: ParsedTransaction,
+  role: PendingAccountRole = "single",
+) => {
   const accounts = await getUserAccounts(userId);
 
   const prompt =
-    parsed.type === "expense"
-      ? "Oke. Pembayarannya pakai akun yang mana?"
-      : "Oke. Uang masuk ke akun yang mana?";
+    role === "source"
+      ? "Oke. Uangnya pindah dari akun yang mana?"
+      : role === "destination"
+        ? "Oke. Uangnya masuk ke akun yang mana?"
+        : parsed.type === "expense"
+          ? "Oke. Pembayarannya pakai akun yang mana?"
+          : "Oke. Uang masuk ke akun yang mana?";
 
   const rows = accounts.map((account, index) => [
-    { text: account.name, callback_data: `a:${compactUuid(pendingId)}:${index}` },
+    {
+      text: account.name,
+      callback_data: `${
+        role === "source" ? "as" : role === "destination" ? "ad" : "a"
+      }:${compactUuid(pendingId)}:${index}`,
+    },
   ]);
   rows.push([
-    { text: "Tambah akun baru", callback_data: `n:${compactUuid(pendingId)}` },
+    {
+      text: "Tambah akun baru",
+      callback_data: `${role === "source" ? "ns" : role === "destination" ? "nd" : "n"}:${compactUuid(pendingId)}`,
+    },
   ]);
 
   await sendTelegramMessage(chatId, prompt, {
@@ -818,6 +1434,15 @@ const rejectPendingTransaction = async (pendingId: string) => {
       confirmed_at: new Date().toISOString(),
     })
     .eq("id", pendingId);
+
+  if (error) throw error;
+};
+
+const deleteTransactionById = async (transactionId: string) => {
+  const { error } = await adminClient
+    .from("transactions")
+    .delete()
+    .eq("id", transactionId);
 
   if (error) throw error;
 };
@@ -868,8 +1493,32 @@ const handleCallbackQuery = async (callbackQuery: {
   const pendingId = decodeUuidToken(pendingToken);
   const accountIndex = accountToken ? Number(accountToken) : undefined;
 
-  if (!pendingId) {
+  if (!pendingId && action !== "dl" && action !== "dc") {
     await answerTelegramCallback(callbackQuery.id, "Aksi tidak valid");
+    return;
+  }
+
+  if (action === "dl") {
+    try {
+      const transactionId = decodeUuidToken(pendingToken);
+      if (!transactionId) {
+        await answerTelegramCallback(callbackQuery.id, "Transaksi tidak valid");
+        return;
+      }
+      await deleteTransactionById(transactionId);
+      await answerTelegramCallback(callbackQuery.id, "Transaksi dihapus");
+      await sendTelegramMessage(chatId, "Oke, transaksi terakhir sudah saya hapus.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Gagal menghapus transaksi";
+      await answerTelegramCallback(callbackQuery.id, "Gagal menghapus");
+      await sendTelegramMessage(chatId, `Maaf, transaksi belum bisa dihapus: ${message}`);
+    }
+    return;
+  }
+
+  if (action === "dc") {
+    await answerTelegramCallback(callbackQuery.id, "Dibatalkan");
+    await sendTelegramMessage(chatId, "Oke, penghapusan transaksi saya batalkan.");
     return;
   }
 
@@ -877,19 +1526,61 @@ const handleCallbackQuery = async (callbackQuery: {
     try {
       const pendingRow = await getPendingTransaction(pendingId);
       const parsed = pendingRow.parsed_payload as ParsedTransaction;
+
+      if (parsed.type === "transfer") {
+        const transferAccounts = await resolveTransferAccounts(
+          pendingRow.user_id,
+          parsed,
+          pendingRow.source_message ?? "",
+        );
+
+        if (transferAccounts.sourceAccount && transferAccounts.destinationAccount) {
+          const saved = await savePendingTransaction(
+            pendingId,
+            transferAccounts.sourceAccount.id,
+            transferAccounts.destinationAccount.id,
+          );
+          await answerTelegramCallback(callbackQuery.id, "Transfer disimpan");
+          await sendTelegramMessage(
+            chatId,
+            buildSavedTransactionMessage(
+              saved,
+              transferAccounts.sourceAccount.name,
+              transferAccounts.destinationAccount.name,
+            ),
+          );
+          return;
+        }
+
+        const nextParsed: ParsedTransaction = {
+          ...parsed,
+          sourceAccountName: transferAccounts.sourceAccount?.name ?? parsed.sourceAccountName ?? null,
+          destinationAccountName: transferAccounts.destinationAccount?.name ?? parsed.destinationAccountName ?? null,
+        };
+        await updatePendingParsedPayload(pendingId, nextParsed);
+
+        await answerTelegramCallback(callbackQuery.id, "Pilih akun dulu");
+        await askForAccountSelection(
+          chatId,
+          pendingId,
+          pendingRow.user_id,
+          nextParsed,
+          transferAccounts.sourceAccount ? "destination" : "source",
+        );
+        return;
+      }
+
       const matchedAccount = await detectMentionedAccount(
         pendingRow.user_id,
         pendingRow.source_message ?? "",
         parsed.description ?? "",
+        parsed.destinationAccountName ?? "",
       );
 
       if (matchedAccount) {
         const saved = await savePendingTransaction(pendingId, matchedAccount.id);
         await answerTelegramCallback(callbackQuery.id, `Disimpan ke ${matchedAccount.name}`);
-        await sendTelegramMessage(
-          chatId,
-          `Sip, transaksi ${saved.type === "expense" ? "pengeluaran" : "pemasukan"} sebesar ${formatCurrency(saved.amount)} sudah saya simpan ke akun ${matchedAccount.name}.`,
-        );
+        await sendTelegramMessage(chatId, buildSavedTransactionMessage(saved, matchedAccount.name));
         return;
       }
 
@@ -903,9 +1594,11 @@ const handleCallbackQuery = async (callbackQuery: {
     return;
   }
 
-  if (action === "n") {
+  if (action === "n" || action === "ns" || action === "nd") {
     try {
-      await setPendingAwaitingAccountName(pendingId);
+      const role: PendingAccountRole =
+        action === "ns" ? "source" : action === "nd" ? "destination" : "single";
+      await setPendingAwaitingAccountName(pendingId, role);
       await answerTelegramCallback(callbackQuery.id, "Ketik nama akun baru");
       await sendTelegramMessage(
         chatId,
@@ -919,7 +1612,7 @@ const handleCallbackQuery = async (callbackQuery: {
     return;
   }
 
-  if (action === "a") {
+  if (action === "a" || action === "as" || action === "ad") {
     if (accountIndex === undefined || Number.isNaN(accountIndex) || accountIndex < 0) {
       await answerTelegramCallback(callbackQuery.id, "Akun tidak valid");
       return;
@@ -936,14 +1629,62 @@ const handleCallbackQuery = async (callbackQuery: {
         return;
       }
 
+      const parsedPayload = pendingRow.parsed_payload as ParsedTransaction;
+
+      if (parsedPayload.type === "transfer" && action !== "a") {
+        const nextParsed: ParsedTransaction = {
+          ...parsedPayload,
+          sourceAccountName: action === "as" ? selectedAccount.name : parsedPayload.sourceAccountName ?? null,
+          destinationAccountName: action === "ad" ? selectedAccount.name : parsedPayload.destinationAccountName ?? null,
+        };
+
+        await updatePendingParsedPayload(pendingId, nextParsed);
+
+        const transferAccounts = await resolveTransferAccounts(
+          pendingRow.user_id,
+          nextParsed,
+          pendingRow.source_message ?? "",
+        );
+
+        if (transferAccounts.sourceAccount && transferAccounts.destinationAccount) {
+          const saved = await savePendingTransaction(
+            pendingId,
+            transferAccounts.sourceAccount.id,
+            transferAccounts.destinationAccount.id,
+          );
+          await answerTelegramCallback(callbackQuery.id, "Transfer disimpan");
+          await sendTelegramMessage(
+            chatId,
+            buildSavedTransactionMessage(
+              saved,
+              transferAccounts.sourceAccount.name,
+              transferAccounts.destinationAccount.name,
+            ),
+          );
+          return;
+        }
+
+        await answerTelegramCallback(callbackQuery.id, "Pilih akun berikutnya");
+        await askForAccountSelection(
+          chatId,
+          pendingId,
+          pendingRow.user_id,
+          nextParsed,
+          transferAccounts.sourceAccount ? "destination" : "source",
+        );
+        return;
+      }
+
       const parsed = await savePendingTransaction(pendingId, selectedAccount.id);
       await answerTelegramCallback(callbackQuery.id, "Transaksi disimpan");
-      await sendTelegramMessage(
-        chatId,
-        `Sip, transaksi ${parsed.type === "expense" ? "pengeluaran" : "pemasukan"} sebesar ${formatCurrency(parsed.amount)} sudah saya simpan.`,
-      );
+      await sendTelegramMessage(chatId, buildSavedTransactionMessage(parsed, selectedAccount.name));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Terjadi kesalahan saat menyimpan transaksi";
+      if (message.includes("Akun asal dan tujuan transfer tidak boleh sama")) {
+        await answerTelegramCallback(callbackQuery.id, "Pilih akun yang berbeda");
+        await sendTelegramMessage(chatId, "Untuk transfer, akun asal dan tujuan harus beda ya. Coba pilih akun lain.");
+        return;
+      }
       await markPendingTransactionFailed(pendingId, message);
       await answerTelegramCallback(callbackQuery.id, "Gagal menyimpan transaksi");
       await sendTelegramMessage(chatId, `Maaf, transaksi belum bisa disimpan: ${message}`);

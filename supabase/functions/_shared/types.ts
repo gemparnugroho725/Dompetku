@@ -1,10 +1,12 @@
 export type ParsedTransaction = {
-  type: "income" | "expense";
+  type: "income" | "expense" | "transfer";
   amount: number;
   category: string;
   description: string;
   date: string;
   confidence: number;
+  sourceAccountName?: string | null;
+  destinationAccountName?: string | null;
 };
 
 export type TelegramLinkStatus = {
