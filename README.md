@@ -108,9 +108,22 @@ Set secret berikut di Supabase sebelum deploy function:
 - `PROJECT_SERVICE_ROLE_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_BOT_USERNAME`
-- `AEROLINK_API_KEY`
+- `AEROLINK_API_KEY` optional jika mau dijadikan provider utama
 - `AEROLINK_BASE_URL`
 - `AEROLINK_MODEL`
+- `NARAROUTER_API_KEY` optional jika mau dijadikan fallback atau provider utama
+- `NARAROUTER_BASE_URL`
+- `NARAROUTER_MODEL`
+
+Bot sekarang mendukung dual provider:
+
+1. Coba `Aerolink` dulu.
+2. Jika Aerolink kena busy / unauthorized / provider gate, otomatis fallback ke `NaraRouter`.
+
+Contoh setup NaraRouter:
+
+- `NARAROUTER_BASE_URL=https://router.bynara.id/v1`
+- `NARAROUTER_MODEL=mistral-large`
 
 ### Telegram Webhook
 

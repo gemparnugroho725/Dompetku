@@ -2,6 +2,7 @@ import { env } from "./env.ts";
 import type { ParsedTransaction } from "./types.ts";
 
 const TODAY_TIMEZONE = "Asia/Bangkok";
+type ProviderName = "Aerolink" | "NaraRouter";
 
 const getTodayDate = () =>
   new Intl.DateTimeFormat("en-CA", {
@@ -118,6 +119,173 @@ const normalizeParsedTransaction = (payload: Record<string, unknown>, sourceMess
   };
 };
 
+const extractOpenAICompatibleText = (content: unknown) => {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .map((item) => {
+      if (typeof item === "string") {
+        return item;
+      }
+
+      if (item && typeof item === "object" && "text" in item && typeof item.text === "string") {
+        return item.text;
+      }
+
+      return "";
+    })
+    .join("\n")
+    .trim();
+};
+
+const requestAerolink = async (prompt: string, maxTokens: number, temperature: number) => {
+  if (!env.aerolinkApiKey) {
+    throw new Error("Aerolink is not configured");
+  }
+
+  const response = await fetch(`${env.aerolinkBaseUrl.replace(/\/$/, "")}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": env.aerolinkApiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: env.aerolinkModel,
+      max_tokens: maxTokens,
+      temperature,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Aerolink request failed: ${response.status} ${body}`);
+  }
+
+  const data = await response.json();
+  const textContent = Array.isArray(data.content)
+    ? data.content
+        .filter((item: { type?: string }) => item.type === "text")
+        .map((item: { text?: string }) => item.text ?? "")
+        .join("\n")
+        .trim()
+    : "";
+
+  if (!textContent) {
+    throw new Error("Aerolink response was empty");
+  }
+
+  return textContent;
+};
+
+const requestNaraRouter = async (prompt: string, maxTokens: number, temperature: number) => {
+  if (!env.nararouterApiKey) {
+    throw new Error("NaraRouter is not configured");
+  }
+
+  const response = await fetch(`${env.nararouterBaseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.nararouterApiKey}`,
+    },
+    body: JSON.stringify({
+      model: env.nararouterModel,
+      temperature,
+      max_tokens: maxTokens,
+      messages: [
+        {
+          role: "system",
+          content: "Kamu adalah asisten AI untuk pencatatan keuangan pribadi. Ikuti format user dengan ketat.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`NaraRouter request failed: ${response.status} ${body}`);
+  }
+
+  const data = await response.json();
+  const textContent = extractOpenAICompatibleText(data.choices?.[0]?.message?.content);
+
+  if (!textContent) {
+    throw new Error("NaraRouter response was empty");
+  }
+
+  return textContent;
+};
+
+const shouldFallbackFromAerolinkError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+
+  return [
+    "Aerolink request failed: 401",
+    "Aerolink request failed: 403",
+    "Aerolink request failed: 429",
+    "Aerolink request failed: 500",
+    "Aerolink request failed: 502",
+    "Aerolink request failed: 503",
+    "Free access is busy right now",
+    "only accepts requests from the official Claude Code CLI",
+  ].some((needle) => message.includes(needle));
+};
+
+const runWithProviders = async (prompt: string, maxTokens: number, temperature: number) => {
+  const errors: string[] = [];
+
+  if (env.aerolinkApiKey) {
+    try {
+      return {
+        provider: "Aerolink" as ProviderName,
+        text: await requestAerolink(prompt, maxTokens, temperature),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Unknown Aerolink error");
+      errors.push(message);
+
+      if (!env.nararouterApiKey || !shouldFallbackFromAerolinkError(error)) {
+        throw error;
+      }
+
+      console.warn("Aerolink failed, falling back to NaraRouter", message);
+    }
+  }
+
+  if (env.nararouterApiKey) {
+    try {
+      return {
+        provider: "NaraRouter" as ProviderName,
+        text: await requestNaraRouter(prompt, maxTokens, temperature),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Unknown NaraRouter error");
+      errors.push(message);
+      console.error("NaraRouter failed after fallback attempt", message);
+      throw new Error(`All AI providers failed: ${errors.join(" | ")}`);
+    }
+  }
+
+  throw new Error(`All AI providers failed: ${errors.join(" | ") || "No AI provider configured"}`);
+};
+
 export const analyzeTransactionText = async (message: string): Promise<ParsedTransaction> => {
   const todayDate = getTodayDate();
   const shouldForceToday = !hasExplicitDateReference(message);
@@ -143,40 +311,10 @@ export const analyzeTransactionText = async (message: string): Promise<ParsedTra
     `Pesan user: ${message}`,
   ].join("\n");
 
-  const response = await fetch(`${env.aerolinkBaseUrl.replace(/\/$/, "")}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": env.aerolinkApiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: env.aerolinkModel,
-      max_tokens: 300,
-      temperature: 0,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    }),
-  });
+  const result = await runWithProviders(prompt, 300, 0);
+  console.log(`Transaction analysis provider: ${result.provider}`);
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Aerolink request failed: ${response.status} ${body}`);
-  }
-
-  const data = await response.json();
-  const textContent = Array.isArray(data.content)
-    ? data.content
-        .filter((item: { type?: string }) => item.type === "text")
-        .map((item: { text?: string }) => item.text ?? "")
-        .join("\n")
-    : "";
-
-  const parsedText = extractJsonObject(textContent);
+  const parsedText = extractJsonObject(result.text);
   const parsed = normalizeParsedTransaction(JSON.parse(parsedText), message);
 
   if (shouldForceToday) {
@@ -218,43 +356,7 @@ export const generateAuditRecommendation = async (input: {
     "3. ...",
   ].join("\n");
 
-  const response = await fetch(`${env.aerolinkBaseUrl.replace(/\/$/, "")}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": env.aerolinkApiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: env.aerolinkModel,
-      max_tokens: 250,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Aerolink request failed: ${response.status} ${body}`);
-  }
-
-  const data = await response.json();
-  const textContent = Array.isArray(data.content)
-    ? data.content
-        .filter((item: { type?: string }) => item.type === "text")
-        .map((item: { text?: string }) => item.text ?? "")
-        .join("\n")
-        .trim()
-    : "";
-
-  if (!textContent) {
-    throw new Error("AI audit response was empty");
-  }
-
-  return textContent;
+  const result = await runWithProviders(prompt, 250, 0.2);
+  console.log(`Audit recommendation provider: ${result.provider}`);
+  return result.text.trim();
 };
