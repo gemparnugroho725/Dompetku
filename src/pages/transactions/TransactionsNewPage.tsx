@@ -40,7 +40,8 @@ export default function TransactionsNewPage() {
       const cats = await getCategories();
       setCategories(cats);
     } catch (err: any) {
-      setErrorMsg('Gagal memuat data dompet atau kategori.');
+      console.error('Gagal memuat data dompet/kategori:', err);
+      setErrorMsg(`Gagal memuat: ${err?.message || err}`);
     }
   };
 

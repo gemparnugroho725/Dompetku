@@ -205,7 +205,7 @@ const requestCustomModel = async (
   const apiKey = provider.api_key;
 
   if (providerType === "gemini") {
-    const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [
+const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } | { image_url: { url: string } } }> = [
       { text: prompt },
     ];
     if (imageUrl) {
@@ -462,7 +462,7 @@ const runWithProviders = async (
     }
   }
 
-  // 2. Default System NaraRouter (Primary default)
+  // 2. Default System NaraRouter (100% Primary)
   if (env.nararouterApiKey) {
     try {
       return {
@@ -472,24 +472,11 @@ const runWithProviders = async (
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? "Unknown NaraRouter error");
       errors.push(message);
-      console.warn("Default NaraRouter failed, rolling to Gemini...", message);
+      console.warn("NaraRouter failed:", message);
     }
   }
 
-  // 3. System Gemini (Secondary fallback)
-  if (env.geminiApiKey) {
-    try {
-      return {
-        provider: "Gemini" as ProviderName,
-        text: await requestGemini(prompt, maxTokens, temperature, imageUrl),
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? "Unknown Gemini error");
-      errors.push(message);
-    }
-  }
-
-  throw new Error(`Semua AI provider gagal: ${errors.join(" | ") || "Tidak ada provider AI yang aktif"}`);
+  throw new Error(`NaraRouter gagal: ${errors.join(" | ") || "Tidak ada provider AI yang aktif"}`);
 };
 
 export const analyzeTransactionText = async (
@@ -518,7 +505,7 @@ export const analyzeTransactionText = async (
     `- jika user tidak menyebut tanggal secara eksplisit, WAJIB pakai tanggal ${todayDate}`,
     "- confidence rentang 0 sampai 1",
     "",
-    imageUrl ? `Analisis gambar struk ini dan sesuaikan dengan pesan user (jika ada): ${message}` : `Pesan user: ${message}`,
+    imageUrl ? `Analisis gambar struk/bukti transfer ini secara mendalam untuk mendapatkan nominal, kategori, dan deskripsi transaksi. Jika ada pesan user, gunakan sebagai konteks tambahan: ${message}` : `Pesan user: ${message}`,
   ].join("\n");
 
   const result = await runWithProviders(prompt, 300, 0, imageUrl, userId);

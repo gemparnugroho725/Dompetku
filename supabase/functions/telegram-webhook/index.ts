@@ -1968,7 +1968,7 @@ const handleTelegramMessage = async (message: {
     let receiptUrl: string | undefined;
 
     if (photo) {
-      await sendTelegramMessage(chatId, "📸 Sedang memproses foto struk dengan AI Gemini...");
+      await sendTelegramMessage(chatId, "📸 Sedang memproses foto struk dengan AI NaraRouter...");
 
       const fileInfo = await getTelegramFile(photo.file_id);
       if (fileInfo.result?.file_path) {
