@@ -13,9 +13,10 @@ const optionalEnv = (name: string) => {
 
 const aerolinkApiKey = optionalEnv("AEROLINK_API_KEY");
 const nararouterApiKey = optionalEnv("NARAROUTER_API_KEY");
+const geminiApiKey = optionalEnv("GEMINI_API_KEY");
 
-if (!aerolinkApiKey && !nararouterApiKey) {
-  throw new Error("Missing AI provider configuration: set AEROLINK_API_KEY or NARAROUTER_API_KEY");
+if (!aerolinkApiKey && !nararouterApiKey && !geminiApiKey) {
+  throw new Error("Missing AI provider configuration: set AEROLINK_API_KEY, NARAROUTER_API_KEY, or GEMINI_API_KEY");
 }
 
 export const env = {
@@ -29,5 +30,7 @@ export const env = {
   aerolinkModel: optionalEnv("AEROLINK_MODEL") ?? "claude-opus-4-8",
   nararouterApiKey,
   nararouterBaseUrl: optionalEnv("NARAROUTER_BASE_URL") ?? "https://router.bynara.id/v1",
-  nararouterModel: optionalEnv("NARAROUTER_MODEL") ?? "mistral-large",
+  nararouterModel: optionalEnv("NARAROUTER_MODEL") ?? "agnes-2.5-flash",
+  geminiApiKey,
+  geminiModelVision: optionalEnv("GEMINI_MODEL_VISION") ?? "gemini-flash-latest",
 };

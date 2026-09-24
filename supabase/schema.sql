@@ -88,9 +88,25 @@ CREATE TABLE public.telegram_pending_transactions (
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'rejected', 'failed')),
   telegram_message_id BIGINT,
   transaction_id UUID REFERENCES public.transactions(id) ON DELETE SET NULL,
+  receipt_url TEXT,
   error_message TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
   confirmed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE public.user_ai_models (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  provider_type TEXT NOT NULL CHECK (provider_type IN ('openai_compatible', 'gemini', 'anthropic')),
+  api_key TEXT NOT NULL,
+  base_url TEXT,
+  model_name TEXT NOT NULL,
+  supports_vision BOOLEAN DEFAULT false NOT NULL,
+  priority INT DEFAULT 1 NOT NULL,
+  is_active BOOLEAN DEFAULT true NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
 -- 3. Configure Row Level Security (RLS)
@@ -101,6 +117,7 @@ ALTER TABLE public.transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.telegram_links ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.telegram_link_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.telegram_pending_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_ai_models ENABLE ROW LEVEL SECURITY;
 
 -- 4. Create Policies
 
@@ -164,6 +181,10 @@ ON public.telegram_link_tokens FOR SELECT USING (auth.uid() = user_id);
 -- Telegram Pending Transactions Policies
 CREATE POLICY "Users can view their own telegram pending transactions"
 ON public.telegram_pending_transactions FOR SELECT USING (auth.uid() = user_id);
+
+-- User AI Models Policies
+CREATE POLICY "Users can manage their own user ai models"
+ON public.user_ai_models FOR ALL USING (auth.uid() = user_id);
 
 -- 5. Create Trigger to Auto-create Profile on Signup
 CREATE OR REPLACE FUNCTION public.handle_new_user()

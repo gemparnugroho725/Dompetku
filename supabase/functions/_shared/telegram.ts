@@ -42,6 +42,20 @@ export const sendTelegramMessage = async (
   });
 };
 
+export const getTelegramFile = async (fileId: string) => {
+  return telegramFetch("getFile", {
+    file_id: fileId,
+  });
+};
+
+export const downloadTelegramFile = async (filePath: string) => {
+  const response = await fetch(`https://api.telegram.org/file/bot${env.telegramBotToken}/${filePath}`);
+  if (!response.ok) {
+    throw new Error(`Failed to download file from Telegram: ${response.statusText}`);
+  }
+  return response.arrayBuffer();
+};
+
 export const answerTelegramCallback = async (callbackQueryId: string, text: string) => {
   return telegramFetch("answerCallbackQuery", {
     callback_query_id: callbackQueryId,

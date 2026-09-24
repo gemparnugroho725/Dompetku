@@ -18,6 +18,7 @@ import TransactionsNewPage from '@/pages/transactions/TransactionsNewPage';
 import AccountsPage from '@/pages/accounts/AccountsPage';
 import CategoriesPage from '@/pages/categories/CategoriesPage';
 import ReportsPage from '@/pages/reports/ReportsPage';
+import AiSettingsPage from '@/pages/settings/AiSettingsPage';
 
 function App() {
   return (
@@ -42,6 +43,7 @@ function App() {
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/categories" element={<CategoriesPage />} />
               <Route path="/reports" element={<ReportsPage />} />
+              <Route path="/settings/ai" element={<AiSettingsPage />} />
             </Route>
           </Routes>
         </BrowserRouter>

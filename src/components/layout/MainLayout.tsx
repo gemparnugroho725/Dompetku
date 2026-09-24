@@ -1,6 +1,6 @@
 import React from 'react';
 import { Navigate, Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Wallet, PlusCircle, LogOut, Menu, X, Moon, Sun, Tags, BarChart3 } from 'lucide-react';
+import { LayoutDashboard, Wallet, PlusCircle, LogOut, Menu, X, Moon, Sun, Tags, BarChart3, Bot } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import { useTheme } from '@/contexts/ThemeContext';
 import { Button } from '@/components/ui/button';
@@ -29,6 +29,7 @@ export default function MainLayout() {
     { name: 'Laporan', path: '/reports', icon: BarChart3 },
     { name: 'Accounts', path: '/accounts', icon: Wallet },
     { name: 'Kategori', path: '/categories', icon: Tags },
+    { name: 'Pengaturan AI', path: '/settings/ai', icon: Bot },
     { name: 'Add Transaction', path: '/transactions/new', icon: PlusCircle },
   ];
 

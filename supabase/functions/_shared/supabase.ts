@@ -8,6 +8,8 @@ export const adminClient = createClient(env.supabaseUrl, env.supabaseServiceRole
   },
 });
 
+export const storage = adminClient.storage;
+
 export const userClient = (authHeader: string) =>
   createClient(env.supabaseUrl, env.supabaseAnonKey, {
     auth: {

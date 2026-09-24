@@ -1,9 +1,21 @@
 import { analyzeTransactionText, generateAuditRecommendation } from "../_shared/ai.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { env } from "../_shared/env.ts";
-import { adminClient } from "../_shared/supabase.ts";
-import { answerTelegramCallback, sendTelegramMessage } from "../_shared/telegram.ts";
+import { adminClient, storage } from "../_shared/supabase.ts";
+import { answerTelegramCallback, downloadTelegramFile, getTelegramFile, sendTelegramMessage } from "../_shared/telegram.ts";
 import type { ParsedTransaction } from "../_shared/types.ts";
+
+const uploadTelegramFile = async (userId: string, fileId: string, mimeType: string, buffer: ArrayBuffer) => {
+  const { data, error } = await storage
+    .from("receipts")
+    .upload(`${userId}/${fileId}`, buffer, {
+      contentType: mimeType,
+      upsert: false,
+    });
+
+  if (error) throw error;
+  return data.path;
+};
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -1089,6 +1101,132 @@ const handleAuditCommand = async (
   await sendTelegramMessage(chatId, lines.join("\n"));
 };
 
+const handleAiModelsCommand = async (chatId: number, userId: string) => {
+  const { data: models, error } = await adminClient
+    .from("user_ai_models")
+    .select("*")
+    .eq("user_id", userId)
+    .order("priority", { ascending: true });
+
+  if (error) throw error;
+
+  const lines = [
+    "🤖 Daftar Model AI milikmu (Rolling Priority):",
+    "",
+  ];
+
+  if (!models || models.length === 0) {
+    lines.push("Belum ada custom model AI. Saat ini bot menggunakan System Default (NaraRouter agnes-2.5-flash).");
+    lines.push("");
+    lines.push("💡 Cara tambah model AI via Telegram:");
+    lines.push("Ketik: /tambahmodel <Nama> <gemini|openai_compatible> <API_KEY> <Model_Name> [Base_URL]");
+    lines.push("Contoh (Gemini): /tambahmodel GeminiKu gemini AIzaSy... gemini-flash-latest");
+    lines.push("Contoh (Groq): /tambahmodel GroqKu openai_compatible gsk_... llama-3.3-70b-versatile https://api.groq.com/openai/v1");
+  } else {
+    models.forEach((m, idx) => {
+      const statusIcon = m.is_active ? "✅" : "❌";
+      const visionIcon = m.supports_vision || m.provider_type === "gemini" ? "📸" : "📝";
+      lines.push(`${idx + 1}. ${m.name} (${statusIcon} Prioritas: ${m.priority})`);
+      lines.push(`   Provider: ${m.provider_type} | Model: ${m.model_name} ${visionIcon}`);
+    });
+    lines.push("");
+    lines.push("Sistem akan mencoba model dari prioritas #1. Jika gagal, otomatis rolling ke model berikutnya.");
+  }
+
+  await sendTelegramMessage(chatId, lines.join("\n"));
+};
+
+const handleTambahModelCommand = async (chatId: number, userId: string, argsText?: string | null) => {
+  if (!argsText) {
+    const help = [
+      "📝 Format Tambah Model AI:",
+      "/tambahmodel <Nama> <Provider> <API_Key> <Model_Name> [Base_URL]",
+      "",
+      "📌 Provider: gemini atau openai_compatible",
+      "",
+      "💡 Contoh 1 (Google Gemini):",
+      "/tambahmodel GeminiKu gemini AIzaSyXXXX gemini-flash-latest",
+      "",
+      "💡 Contoh 2 (Groq / Custom OpenAI):",
+      "/tambahmodel GroqKu openai_compatible gsk_XXXX llama-3.3-70b-versatile https://api.groq.com/openai/v1",
+    ].join("\n");
+    await sendTelegramMessage(chatId, help);
+    return;
+  }
+
+  const parts = argsText.trim().split(/\s+/);
+  if (parts.length < 4) {
+    await sendTelegramMessage(chatId, "Format salah. Gunakan: /tambahmodel <Nama> <Provider> <API_Key> <Model_Name> [Base_URL]");
+    return;
+  }
+
+  const [name, providerType, apiKey, modelName, baseUrl] = parts;
+  const pType = providerType.toLowerCase();
+  if (!["gemini", "openai_compatible", "anthropic"].includes(pType)) {
+    await sendTelegramMessage(chatId, "Provider type harus gemini atau openai_compatible.");
+    return;
+  }
+
+  const supportsVision = pType === "gemini" || modelName.includes("vision") || modelName.includes("flash") || modelName.includes("4o");
+
+  const { error } = await adminClient
+    .from("user_ai_models")
+    .insert({
+      user_id: userId,
+      name,
+      provider_type: pType,
+      api_key: apiKey,
+      model_name: modelName,
+      base_url: baseUrl ?? null,
+      supports_vision: supportsVision,
+      priority: 1,
+      is_active: true,
+    });
+
+  if (error) {
+    await sendTelegramMessage(chatId, `Gagal menambahkan model AI: ${error.message}`);
+    return;
+  }
+
+  await sendTelegramMessage(chatId, `✅ Model AI "${name}" (${modelName}) berhasil ditambahkan ke daftar rolling modelmu!`);
+};
+
+const handleHapusModelCommand = async (chatId: number, userId: string, query?: string | null) => {
+  if (!query) {
+    const { data: models } = await adminClient
+      .from("user_ai_models")
+      .select("id, name, model_name")
+      .eq("user_id", userId);
+
+    if (!models || models.length === 0) {
+      await sendTelegramMessage(chatId, "Belum ada model AI yang tersimpan.");
+      return;
+    }
+
+    const lines = [
+      "🗑️ Pilih nama model yang mau dihapus:",
+      "Ketik: /hapusmodel <NamaModel>",
+      "",
+      ...models.map((m) => `- ${m.name} (${m.model_name})`),
+    ];
+    await sendTelegramMessage(chatId, lines.join("\n"));
+    return;
+  }
+
+  const { error } = await adminClient
+    .from("user_ai_models")
+    .delete()
+    .eq("user_id", userId)
+    .ilike("name", `%${query.trim()}%`);
+
+  if (error) {
+    await sendTelegramMessage(chatId, `Gagal menghapus model AI: ${error.message}`);
+    return;
+  }
+
+  await sendTelegramMessage(chatId, `✅ Model AI "${query}" berhasil dihapus.`);
+};
+
 const handleCommandMessage = async (chatId: number, text: string) => {
   const [command, ...args] = text.split(/\s+/);
   const normalizedCommand = command.toLowerCase();
@@ -1178,6 +1316,21 @@ const handleCommandMessage = async (chatId: number, text: string) => {
     return true;
   }
 
+  if (normalizedCommand === "/aimodels" || normalizedCommand === "/aimodel" || normalizedCommand === "/model") {
+    await handleAiModelsCommand(chatId, userId);
+    return true;
+  }
+
+  if (normalizedCommand === "/tambahmodel") {
+    await handleTambahModelCommand(chatId, userId, query);
+    return true;
+  }
+
+  if (normalizedCommand === "/hapusmodel") {
+    await handleHapusModelCommand(chatId, userId, query);
+    return true;
+  }
+
   if (normalizedCommand.startsWith("/")) {
     await sendTelegramMessage(chatId, "Perintah belum tersedia. Coba /help untuk lihat daftar perintah.");
     return true;
@@ -1230,6 +1383,8 @@ const handleTransactionMessage = async (
   chatId: number,
   userId: string,
   text: string,
+  base64Image?: string,
+  receiptUrl?: string,
 ) => {
   const awaitingPending = await getAwaitingAccountPendingTransaction(userId);
   if (awaitingPending) {
@@ -1288,17 +1443,18 @@ const handleTransactionMessage = async (
     return;
   }
 
-  const parsed = await analyzeTransactionText(text);
+  const parsed = await analyzeTransactionText(text || "Analisis foto struk ini", base64Image, userId);
 
   const { data: pendingRow, error } = await adminClient
     .from("telegram_pending_transactions")
     .insert({
       user_id: userId,
       telegram_chat_id: chatId,
-      source_message: text,
+      source_message: text || "[Foto Struk]",
       parsed_payload: parsed,
-      ai_model: env.aerolinkModel,
+      ai_model: base64Image ? (env.geminiModelVision ?? "gemini-1.5-flash") : env.aerolinkModel,
       status: "pending",
+      receipt_url: receiptUrl ?? null,
     })
     .select("id")
     .single();
@@ -1327,7 +1483,7 @@ const handleTransactionMessage = async (
 const getPendingTransaction = async (pendingId: string) => {
   const { data: pendingRow, error } = await adminClient
     .from("telegram_pending_transactions")
-    .select("id, user_id, status, parsed_payload, source_message, error_message")
+    .select("id, user_id, status, parsed_payload, source_message, error_message, receipt_url")
     .eq("id", pendingId)
     .maybeSingle();
 
@@ -1367,8 +1523,8 @@ const savePendingTransaction = async (pendingId: string, accountId: string, toAc
       category_id: categoryId,
       amount: parsed.amount,
       description: parsed.description,
-      tags: "telegram,ai",
-      receipt_url: null,
+      tags: pendingRow.receipt_url ? "telegram,ai,ocr" : "telegram,ai",
+      receipt_url: pendingRow.receipt_url ?? null,
     })
     .select("id")
     .single();
@@ -1483,6 +1639,18 @@ const toUserFacingErrorMessage = (error: unknown) => {
 
   if (message.includes("Invalid amount returned by AI")) {
     return "Saya belum bisa membaca nominalnya. Coba kirim lagi dengan jumlah yang lebih jelas, misalnya: beli kopi 10000 cash atau masuk ke BCA 250000.";
+  }
+
+  if (message.includes("Gemini is not configured") || message.includes("API key or model is missing")) {
+    return "Fitur OCR foto struk memerlukan API Key Gemini. Pastikan GEMINI_API_KEY sudah dipasang di environment variable Supabase.";
+  }
+
+  if (message.includes("Gemini image processing failed")) {
+    return "Gagal membaca foto struk. Pastikan foto terang, tidak miring/buram, lalu coba kirim ulang.";
+  }
+
+  if (message.includes("Gemini request failed")) {
+    return `Layanan Gemini AI gagal memproses permintaan. Coba kirim ulang beberapa saat lagi. (${message})`;
   }
 
   if (message.includes("Aerolink request failed: 503")) {
@@ -1740,16 +1908,28 @@ const handleCallbackQuery = async (callbackQuery: {
   await answerTelegramCallback(callbackQuery.id, "Aksi tidak dikenali");
 };
 
+const bufferToBase64 = (buffer: ArrayBuffer) => {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+};
+
 const handleTelegramMessage = async (message: {
   chat: { id: number };
   from?: { id: number; username?: string; first_name?: string; last_name?: string };
   text?: string;
+  caption?: string;
+  photo?: Array<{ file_id: string; width: number; height: number; file_size?: number }>;
 }) => {
   const chatId = message.chat.id;
-  const text = message.text?.trim();
+  const text = message.text?.trim() ?? message.caption?.trim() ?? "";
+  const photo = message.photo && message.photo.length > 0 ? message.photo[message.photo.length - 1] : null;
 
-  if (!text) {
-    await sendTelegramMessage(chatId, "Saat ini saya baru bisa memproses pesan teks transaksi.");
+  if (!text && !photo) {
+    await sendTelegramMessage(chatId, "Saat ini saya baru bisa memproses pesan teks transaksi atau foto struk.");
     return;
   }
 
@@ -1759,7 +1939,7 @@ const handleTelegramMessage = async (message: {
     return;
   }
 
-  if (await handleCommandMessage(chatId, text)) {
+  if (text && (await handleCommandMessage(chatId, text))) {
     return;
   }
 
@@ -1775,7 +1955,33 @@ const handleTelegramMessage = async (message: {
     .eq("telegram_chat_id", chatId);
 
   try {
-    await handleTransactionMessage(chatId, userId, text);
+    let base64Image: string | undefined;
+    let receiptUrl: string | undefined;
+
+    if (photo) {
+      await sendTelegramMessage(chatId, "📸 Sedang memproses foto struk dengan AI Gemini...");
+
+      const fileInfo = await getTelegramFile(photo.file_id);
+      if (fileInfo.result?.file_path) {
+        const imageBuffer = await downloadTelegramFile(fileInfo.result.file_path);
+        base64Image = bufferToBase64(imageBuffer);
+
+        try {
+          const storagePath = await uploadTelegramFile(
+            userId,
+            `${Date.now()}_${photo.file_id}.jpg`,
+            "image/jpeg",
+            imageBuffer,
+          );
+          const { data: publicUrlData } = adminClient.storage.from("receipts").getPublicUrl(storagePath);
+          receiptUrl = publicUrlData.publicUrl;
+        } catch (uploadError) {
+          console.warn("Gagal upload foto ke Supabase Storage:", uploadError);
+        }
+      }
+    }
+
+    await handleTransactionMessage(chatId, userId, text, base64Image, receiptUrl);
   } catch (error) {
     console.error(error);
     await sendTelegramMessage(chatId, toUserFacingErrorMessage(error));

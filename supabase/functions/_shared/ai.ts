@@ -1,8 +1,9 @@
+import { adminClient } from "./supabase.ts";
 import { env } from "./env.ts";
-import type { ParsedTransaction } from "./types.ts";
+import type { ParsedTransaction, UserAiModel } from "./types.ts";
 
 const TODAY_TIMEZONE = "Asia/Bangkok";
-type ProviderName = "Aerolink" | "NaraRouter";
+type ProviderName = string;
 
 const getTodayDate = () =>
   new Intl.DateTimeFormat("en-CA", {
@@ -190,10 +191,134 @@ const requestAerolink = async (prompt: string, maxTokens: number, temperature: n
   return textContent;
 };
 
-const requestNaraRouter = async (prompt: string, maxTokens: number, temperature: number) => {
+const requestCustomModel = async (
+  model: UserAiModel,
+  prompt: string,
+  maxTokens: number,
+  temperature: number,
+  imageUrl?: string,
+) => {
+  if (model.provider_type === "gemini") {
+    const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [
+      { text: prompt },
+    ];
+    if (imageUrl) {
+      parts.push({ inline_data: { mime_type: "image/jpeg", data: imageUrl } });
+    }
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model.model_name}:generateContent?key=${model.api_key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature, maxOutputTokens: maxTokens },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`[${model.name}] Gemini API ${response.status}: ${body}`);
+    }
+
+    const data = await response.json();
+    const textContent = extractOpenAICompatibleText(data.candidates?.[0]?.content?.parts?.[0]?.text);
+    if (!textContent) throw new Error(`[${model.name}] Empty Gemini response`);
+    return textContent;
+  }
+
+  if (model.provider_type === "openai_compatible") {
+    const baseUrl = (model.base_url || "https://api.openai.com/v1").replace(/\/$/, "");
+    const userContent = imageUrl
+      ? [
+          { type: "text", text: prompt },
+          {
+            type: "image_url",
+            image_url: {
+              url: imageUrl.startsWith("data:") ? imageUrl : `data:image/jpeg;base64,${imageUrl}`,
+            },
+          },
+        ]
+      : prompt;
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${model.api_key}`,
+      },
+      body: JSON.stringify({
+        model: model.model_name,
+        temperature,
+        max_tokens: maxTokens,
+        messages: [
+          {
+            role: "system",
+            content: "Kamu adalah asisten AI pencatat keuangan. Balas HANYA JSON valid.",
+          },
+          { role: "user", content: userContent },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`[${model.name}] AI Provider ${response.status}: ${body}`);
+    }
+
+    const data = await response.json();
+    const textContent = extractOpenAICompatibleText(data.choices?.[0]?.message?.content);
+    if (!textContent) throw new Error(`[${model.name}] Empty AI response`);
+    return textContent;
+  }
+
+  throw new Error(`Unsupported provider type: ${model.provider_type}`);
+};
+
+const getUserAiModels = async (userId: string): Promise<UserAiModel[]> => {
+  try {
+    const { data, error } = await adminClient
+      .from("user_ai_models")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("is_active", true)
+      .order("priority", { ascending: true });
+
+    if (error) {
+      console.warn("Could not load user_ai_models:", error.message);
+      return [];
+    }
+
+    return data ?? [];
+  } catch (err) {
+    console.warn("Failed to fetch user_ai_models:", err);
+    return [];
+  }
+};
+
+const requestNaraRouter = async (
+  prompt: string,
+  maxTokens: number,
+  temperature: number,
+  imageUrl?: string,
+) => {
   if (!env.nararouterApiKey) {
     throw new Error("NaraRouter is not configured");
   }
+
+  const userContent = imageUrl
+    ? [
+        { type: "text", text: prompt },
+        {
+          type: "image_url",
+          image_url: {
+            url: imageUrl.startsWith("data:") ? imageUrl : `data:image/jpeg;base64,${imageUrl}`,
+          },
+        },
+      ]
+    : prompt;
 
   const response = await fetch(`${env.nararouterBaseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
@@ -208,11 +333,11 @@ const requestNaraRouter = async (prompt: string, maxTokens: number, temperature:
       messages: [
         {
           role: "system",
-          content: "Kamu adalah asisten AI untuk pencatatan keuangan pribadi. Ikuti format user dengan ketat.",
+          content: "Kamu adalah asisten AI untuk pencatatan keuangan pribadi. Ikuti format JSON dengan ketat.",
         },
         {
           role: "user",
-          content: prompt,
+          content: userContent,
         },
       ],
     }),
@@ -233,6 +358,57 @@ const requestNaraRouter = async (prompt: string, maxTokens: number, temperature:
   return textContent;
 };
 
+const requestGemini = async (prompt: string, maxTokens: number, temperature: number, imageUrl?: string) => {
+  if (!env.geminiApiKey) {
+    throw new Error("Gemini is not configured");
+  }
+
+  const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [
+    { text: prompt },
+  ];
+
+  if (imageUrl) {
+    parts.push({ inline_data: { mime_type: "image/jpeg", data: imageUrl } });
+  }
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${env.geminiModelVision}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": env.geminiApiKey,
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts,
+          },
+        ],
+        generationConfig: {
+          temperature,
+          maxOutputTokens: maxTokens,
+        },
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Gemini request failed: ${response.status} ${body}`);
+  }
+
+  const data = await response.json();
+  const textContent = extractOpenAICompatibleText(data.candidates?.[0]?.content?.parts?.[0]?.text);
+
+  if (!textContent) {
+    throw new Error("Gemini response was empty");
+  }
+
+  return textContent;
+};
+
 const shouldFallbackFromAerolinkError = (error: unknown) => {
   const message = error instanceof Error ? error.message : String(error ?? "");
 
@@ -248,45 +424,73 @@ const shouldFallbackFromAerolinkError = (error: unknown) => {
   ].some((needle) => message.includes(needle));
 };
 
-const runWithProviders = async (prompt: string, maxTokens: number, temperature: number) => {
+const runWithProviders = async (
+  prompt: string,
+  maxTokens: number,
+  temperature: number,
+  imageUrl?: string,
+  userId?: string,
+) => {
   const errors: string[] = [];
 
-  if (env.aerolinkApiKey) {
-    try {
-      return {
-        provider: "Aerolink" as ProviderName,
-        text: await requestAerolink(prompt, maxTokens, temperature),
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? "Unknown Aerolink error");
-      errors.push(message);
+  // 1. Try User Custom AI Models (rolling in priority order)
+  if (userId) {
+    const customModels = await getUserAiModels(userId);
+    const applicableModels = imageUrl
+      ? customModels.filter((m) => m.supports_vision || m.provider_type === "gemini")
+      : customModels;
 
-      if (!env.nararouterApiKey || !shouldFallbackFromAerolinkError(error)) {
-        throw error;
+    for (const model of applicableModels) {
+      try {
+        console.log(`[Rolling AI] Executing user custom model: ${model.name} (${model.model_name})`);
+        const text = await requestCustomModel(model, prompt, maxTokens, temperature, imageUrl);
+        return {
+          provider: model.name as ProviderName,
+          text,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(message);
+        console.warn(`[Rolling AI] Custom model ${model.name} failed. Rolling to next...`, message);
       }
-
-      console.warn("Aerolink failed, falling back to NaraRouter", message);
     }
   }
 
+  // 2. Default System NaraRouter (Primary default)
   if (env.nararouterApiKey) {
     try {
       return {
         provider: "NaraRouter" as ProviderName,
-        text: await requestNaraRouter(prompt, maxTokens, temperature),
+        text: await requestNaraRouter(prompt, maxTokens, temperature, imageUrl),
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? "Unknown NaraRouter error");
       errors.push(message);
-      console.error("NaraRouter failed after fallback attempt", message);
-      throw new Error(`All AI providers failed: ${errors.join(" | ")}`);
+      console.warn("Default NaraRouter failed, rolling to Gemini...", message);
     }
   }
 
-  throw new Error(`All AI providers failed: ${errors.join(" | ") || "No AI provider configured"}`);
+  // 3. System Gemini (Secondary fallback)
+  if (env.geminiApiKey) {
+    try {
+      return {
+        provider: "Gemini" as ProviderName,
+        text: await requestGemini(prompt, maxTokens, temperature, imageUrl),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Unknown Gemini error");
+      errors.push(message);
+    }
+  }
+
+  throw new Error(`Semua AI provider gagal: ${errors.join(" | ") || "Tidak ada provider AI yang aktif"}`);
 };
 
-export const analyzeTransactionText = async (message: string): Promise<ParsedTransaction> => {
+export const analyzeTransactionText = async (
+  message: string,
+  imageUrl?: string,
+  userId?: string,
+): Promise<ParsedTransaction> => {
   const todayDate = getTodayDate();
   const shouldForceToday = !hasExplicitDateReference(message);
 
@@ -308,10 +512,10 @@ export const analyzeTransactionText = async (message: string): Promise<ParsedTra
     `- jika user tidak menyebut tanggal secara eksplisit, WAJIB pakai tanggal ${todayDate}`,
     "- confidence rentang 0 sampai 1",
     "",
-    `Pesan user: ${message}`,
+    imageUrl ? `Analisis gambar struk ini dan sesuaikan dengan pesan user (jika ada): ${message}` : `Pesan user: ${message}`,
   ].join("\n");
 
-  const result = await runWithProviders(prompt, 300, 0);
+  const result = await runWithProviders(prompt, 300, 0, imageUrl, userId);
   console.log(`Transaction analysis provider: ${result.provider}`);
 
   const parsedText = extractJsonObject(result.text);
