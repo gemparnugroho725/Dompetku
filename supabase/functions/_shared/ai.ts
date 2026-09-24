@@ -198,7 +198,13 @@ const requestCustomModel = async (
   temperature: number,
   imageUrl?: string,
 ) => {
-  if (model.provider_type === "gemini") {
+  const provider = model.provider;
+  if (!provider) throw new Error(`[${model.name}] Provider data missing (join failed)`);
+
+  const providerType = provider.provider_type;
+  const apiKey = provider.api_key;
+
+  if (providerType === "gemini") {
     const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [
       { text: prompt },
     ];
@@ -207,7 +213,7 @@ const requestCustomModel = async (
     }
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model.model_name}:generateContent?key=${model.api_key}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${model.model_name}:generateContent?key=${apiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -229,8 +235,8 @@ const requestCustomModel = async (
     return textContent;
   }
 
-  if (model.provider_type === "openai_compatible") {
-    const baseUrl = (model.base_url || "https://api.openai.com/v1").replace(/\/$/, "");
+  if (providerType === "openai_compatible") {
+    const baseUrl = (provider.base_url || "https://api.openai.com/v1").replace(/\/$/, "");
     const userContent = imageUrl
       ? [
           { type: "text", text: prompt },
@@ -247,7 +253,7 @@ const requestCustomModel = async (
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${model.api_key}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model: model.model_name,
@@ -274,14 +280,14 @@ const requestCustomModel = async (
     return textContent;
   }
 
-  throw new Error(`Unsupported provider type: ${model.provider_type}`);
+  throw new Error(`Unsupported provider type: ${providerType}`);
 };
 
 const getUserAiModels = async (userId: string): Promise<UserAiModel[]> => {
   try {
     const { data, error } = await adminClient
       .from("user_ai_models")
-      .select("*")
+      .select("*, provider:user_ai_providers(*)")
       .eq("user_id", userId)
       .eq("is_active", true)
       .order("priority", { ascending: true });
@@ -437,7 +443,7 @@ const runWithProviders = async (
   if (userId) {
     const customModels = await getUserAiModels(userId);
     const applicableModels = imageUrl
-      ? customModels.filter((m) => m.supports_vision || m.provider_type === "gemini")
+      ? customModels.filter((m) => m.supports_vision || m.provider?.provider_type === "gemini")
       : customModels;
 
     for (const model of applicableModels) {
