@@ -166,21 +166,17 @@ export default function AiSettingsPage() {
     setTestingId(model.id);
     setTestResult(null);
     try {
-      if (provider.provider_type === 'gemini') {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model.model_name}:generateContent?key=${provider.api_key}`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contents: [{ parts: [{ text: 'Ping' }] }] }) }
-        );
-        setTestResult({ id: model.id, success: res.ok, message: res.ok ? 'Koneksi Berhasil ✓' : `Error ${res.status}` });
-      } else {
-        const url = (provider.base_url || 'https://api.openai.com/v1').replace(/\/$/, '');
-        const res = await fetch(`${url}/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.api_key}` },
-          body: JSON.stringify({ model: model.model_name, messages: [{ role: 'user', content: 'Ping' }] }),
-        });
-        setTestResult({ id: model.id, success: res.ok, message: res.ok ? 'Koneksi Berhasil ✓' : `Error ${res.status}: ${await res.text()}` });
-      }
+      // Proxy via Edge Function to avoid CORS issues
+      const { data, error } = await supabase.functions.invoke('telegram-webhook/test-model', {
+        body: {
+          provider_type: provider.provider_type,
+          api_key: provider.api_key,
+          base_url: provider.base_url,
+          model_name: model.model_name,
+        },
+      });
+      if (error) throw error;
+      setTestResult({ id: model.id, success: data.success, message: data.message });
     } catch (err: any) {
       setTestResult({ id: model.id, success: false, message: `Gagal: ${err.message}` });
     } finally {

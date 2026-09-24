@@ -2002,6 +2002,51 @@ Deno.serve(async (request) => {
     return new Response("ok", { headers: corsHeaders });
   }
 
+  const url = new URL(request.url);
+
+  // Test model connection (server-side proxy to avoid CORS)
+  if (url.pathname.endsWith("/test-model") && request.method === "POST") {
+    try {
+      const { provider_type, api_key, base_url, model_name } = await request.json();
+
+      if (!provider_type || !api_key || !model_name) {
+        return json({ success: false, message: "Missing required fields" }, 400);
+      }
+
+      if (provider_type === "gemini") {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model_name}:generateContent?key=${api_key}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ contents: [{ parts: [{ text: "Ping" }] }] }),
+          }
+        );
+        const body = await res.text();
+        return json({ success: res.ok, message: res.ok ? "Koneksi Berhasil ✓" : `Error ${res.status}: ${body}` });
+      }
+
+      if (provider_type === "openai_compatible") {
+        const cleanUrl = (base_url || "https://api.openai.com/v1").replace(/\/$/, "");
+        const res = await fetch(`${cleanUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${api_key}` },
+          body: JSON.stringify({
+            model: model_name,
+            max_tokens: 5,
+            messages: [{ role: "user", content: "Ping" }],
+          }),
+        });
+        const body = await res.text();
+        return json({ success: res.ok, message: res.ok ? "Koneksi Berhasil ✓" : `Error ${res.status}: ${body}` });
+      }
+
+      return json({ success: false, message: `Unsupported provider type: ${provider_type}` });
+    } catch (error) {
+      return json({ success: false, message: error instanceof Error ? error.message : "Unknown error" });
+    }
+  }
+
   try {
     const update = await request.json();
 
