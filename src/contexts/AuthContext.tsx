@@ -29,6 +29,10 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
       setSession(session);
       setUser(session?.user ?? null);
       setIsLoading(false);
+      // Force token refresh so expired access tokens are renewed
+      if (session) {
+        supabase.auth.refreshSession();
+      }
     });
 
     // Listen for auth changes
