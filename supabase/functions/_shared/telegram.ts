@@ -62,3 +62,27 @@ export const answerTelegramCallback = async (callbackQueryId: string, text: stri
     text,
   });
 };
+
+export const registerTelegramBotCommands = async () => {
+  return telegramFetch("setMyCommands", {
+    commands: [
+      { command: "help", description: "Daftar perintah bot" },
+      { command: "aimodels", description: "Kelola model AI & API Key (Rolling)" },
+      { command: "tambahmodel", description: "Tambah custom AI model" },
+      { command: "hapusmodel", description: "Hapus custom AI model" },
+      { command: "checksaldo", description: "Cek saldo total & per akun" },
+      { command: "saldo", description: "Cek saldo akun tertentu" },
+      { command: "mutasi", description: "Lihat 5 transaksi terakhir" },
+      { command: "cari", description: "Cari transaksi dari kata kunci" },
+      { command: "akun", description: "Daftar akun keuangan" },
+      { command: "budget", description: "Cek status budget bulan ini" },
+      { command: "ringkasan", description: "Ringkasan hari, minggu, bulan" },
+      { command: "topkategori", description: "Kategori pengeluaran terbesar" },
+      { command: "boros", description: "Bandingkan pengeluaran vs lalu" },
+      { command: "status", description: "Cek status keaktifan bot" },
+      { command: "auditharian", description: "Audit pengeluaran hari ini" },
+      { command: "auditmingguan", description: "Audit pengeluaran minggu ini" },
+      { command: "auditbulanan", description: "Audit pengeluaran bulan ini" },
+    ],
+  });
+};

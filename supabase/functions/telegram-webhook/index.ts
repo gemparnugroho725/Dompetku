@@ -2,7 +2,7 @@ import { analyzeTransactionText, generateAuditRecommendation } from "../_shared/
 import { corsHeaders } from "../_shared/cors.ts";
 import { env } from "../_shared/env.ts";
 import { adminClient, storage } from "../_shared/supabase.ts";
-import { answerTelegramCallback, downloadTelegramFile, getTelegramFile, sendTelegramMessage } from "../_shared/telegram.ts";
+import { answerTelegramCallback, downloadTelegramFile, getTelegramFile, registerTelegramBotCommands, sendTelegramMessage } from "../_shared/telegram.ts";
 import type { ParsedTransaction } from "../_shared/types.ts";
 
 const uploadTelegramFile = async (userId: string, fileId: string, mimeType: string, buffer: ArrayBuffer) => {
@@ -471,8 +471,12 @@ const sendLinkingInstructions = async (chatId: number) => {
 
 const buildHelpText = () =>
   [
-    "Perintah yang bisa dipakai:",
-    "/help - lihat daftar perintah",
+    "🤖 *Perintah Model AI & API Key:*",
+    "/aimodels - kelola daftar model AI (rolling priority)",
+    "/tambahmodel <Nama> <Provider> <Key> <Model> [BaseURL]",
+    "/hapusmodel <NamaModel> - hapus custom model AI",
+    "",
+    "💰 *Perintah Keuangan:*",
     "/checksaldo - cek saldo total dan per akun",
     "/saldo <akun> - cek saldo akun tertentu",
     "/mutasi - lihat 5 transaksi terakhir",
@@ -488,10 +492,10 @@ const buildHelpText = () =>
     "/auditmingguan - audit minggu kalender ini",
     "/auditbulanan - audit bulan berjalan",
     "",
-    "Kamu juga bisa langsung chat transaksi, misalnya:",
-    "beli kopi 10000 cash",
-    "masuk ke BCA 250000",
-    "transfer BRI ke Cash 100000",
+    "📸 *Catat Transaksi Otomatis:*",
+    "• Teks: beli kopi 10000 cash",
+    "• Transfer: transfer BRI ke Cash 100000",
+    "• Struk/Nota: Kirim foto bukti transfer / struk belanja!",
   ].join("\n");
 
 const getAccountsWithBalances = async (userId: string) => {
@@ -1233,6 +1237,11 @@ const handleCommandMessage = async (chatId: number, text: string) => {
   const query = args.join(" ").trim() || null;
 
   if (normalizedCommand === "/help" || normalizedCommand === "/start") {
+    try {
+      await registerTelegramBotCommands();
+    } catch (e) {
+      console.warn("Failed to setMyCommands:", e);
+    }
     await sendTelegramMessage(chatId, buildHelpText());
     return true;
   }
